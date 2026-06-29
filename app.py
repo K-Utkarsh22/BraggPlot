@@ -710,55 +710,181 @@ if __name__ == "__main__":
 
     st.divider()
 
-    # --- 6. Main page: control bar (uploader + axis inputs + button) -
+    # --- 6. Main page: verification mode toggle --------------------------
+    # When checked, the app skips OpenCV peak detection entirely and lets
+    # the user type 2-Theta values directly, so the math engine
+    # (calculate_crystal_structure) can be sanity-checked in isolation
+    # from the image-processing pipeline.
+    manual_mode = st.checkbox(
+        "Manual Peak Input",
+        help=(
+            "Skip image-based peak detection and type 2-Theta peak "
+            "values directly, to verify the crystal-structure math "
+            "engine independent of OpenCV peak detection."
+        ),
+    )
+
+    # --- 7. Main page: control bar (uploader/axis OR manual text input) -
     # This row acts as a persistent "top bar": once results are shown,
     # this same row stays put at the top of the page rather than being
     # replaced, so the user can immediately re-calibrate and re-analyze
     # without scrolling back up or losing context.
-    control_upload, control_start, control_end, control_button = st.columns(
-        [3, 1, 1, 1]
-    )
+    if manual_mode:
+        # --- Verification Mode: a single text input replaces the
+        # uploader and both axis-calibration fields. ---
+        control_manual, control_button = st.columns([4, 1])
 
-    with control_upload:
-        uploaded_file = st.file_uploader(
-            "Upload a diffractogram image",
-            type=["png", "jpg", "jpeg"],
-            label_visibility="collapsed",
-            help="Upload a PNG/JPG/JPEG image of an XRD diffractogram.",
+        with control_manual:
+            manual_peaks_text = st.text_input(
+                "Enter 2-Theta values (comma-separated)",
+                placeholder="e.g. 44.67, 65.02, 82.33, 98.94, 116.38, 137.15",
+                help=(
+                    "Type 2-Theta peak positions in degrees, separated "
+                    "by commas. These values bypass image processing "
+                    "and are passed directly to the crystal-structure "
+                    "calculation."
+                ),
+            )
+
+        with control_button:
+            st.write("")
+            analyze_clicked = st.button(
+                "Analyze", type="primary", use_container_width=True
+            )
+
+        # Uploader and axis fields are hidden in manual mode; defined as
+        # None/defaults here so later code that references them (outside
+        # this branch) never hits a NameError.
+        uploaded_file = None
+        axis_start, axis_end = 20.0, 80.0
+    else:
+        # --- Normal Mode: uploader + Axis Calibration fields, as before.
+        control_upload, control_start, control_end, control_button = st.columns(
+            [3, 1, 1, 1]
         )
 
-    with control_start:
-        axis_start = st.number_input(
-            "Axis Start",
-            value=20.0,
-            step=1.0,
-            help="2-Theta value (degrees) at the left edge of the plot.",
-        )
+        with control_upload:
+            uploaded_file = st.file_uploader(
+                "Upload a diffractogram image",
+                type=["png", "jpg", "jpeg"],
+                label_visibility="collapsed",
+                help="Upload a PNG/JPG/JPEG image of an XRD diffractogram.",
+            )
 
-    with control_end:
-        axis_end = st.number_input(
-            "Axis End",
-            value=80.0,
-            step=1.0,
-            help="2-Theta value (degrees) at the right edge of the plot.",
-        )
+        with control_start:
+            axis_start = st.number_input(
+                "Axis Start",
+                value=20.0,
+                step=1.0,
+                help="2-Theta value (degrees) at the left edge of the plot.",
+            )
 
-    with control_button:
-        # A little vertical spacing so the button lines up with the
-        # number inputs instead of their labels.
-        st.write("")
-        analyze_clicked = st.button("Analyze", type="primary", use_container_width=True)
+        with control_end:
+            axis_end = st.number_input(
+                "Axis End",
+                value=80.0,
+                step=1.0,
+                help="2-Theta value (degrees) at the right edge of the plot.",
+            )
+
+        with control_button:
+            # A little vertical spacing so the button lines up with the
+            # number inputs instead of their labels.
+            st.write("")
+            analyze_clicked = st.button(
+                "Analyze", type="primary", use_container_width=True
+            )
+
+        # Manual text input is hidden in normal mode; defined as an empty
+        # string here so later code that references it never hits a
+        # NameError.
+        manual_peaks_text = ""
 
     st.divider()
 
-    # --- 7. Analysis trigger -------------------------------------------
+    # --- 8. Analysis trigger -------------------------------------------
     # Analysis now runs ONLY when the "Analyze" button is explicitly
     # clicked (previously it ran automatically the instant a file was
     # uploaded). This is a deliberate behavior change to match the new
     # explicit-button control bar -- flagging it clearly since it
     # differs from every prior version of this app.
     if analyze_clicked:
-        if uploaded_file is None:
+        if manual_mode:
+            # --- Verification Mode: skip extract_peaks entirely -------
+            # Parse the comma-separated text directly into a list of
+            # floats and feed it straight to calculate_crystal_structure,
+            # so the math engine can be validated independent of OpenCV.
+            raw_tokens = [tok.strip() for tok in manual_peaks_text.split(",")]
+            raw_tokens = [tok for tok in raw_tokens if tok]  # drop blanks
+
+            if not raw_tokens:
+                st.warning(
+                    "Please enter at least one 2-Theta value "
+                    "(comma-separated) before analyzing."
+                )
+            else:
+                try:
+                    peaks_2theta = [float(tok) for tok in raw_tokens]
+                except ValueError:
+                    st.error(
+                        "Could not parse the entered values. Please "
+                        "enter numbers only, separated by commas "
+                        "(e.g. '44.67, 65.02, 82.33')."
+                    )
+                    peaks_2theta = None
+
+                if peaks_2theta is not None:
+                    try:
+                        # Step 2: run the physics directly on the
+                        # user-supplied peaks -- no image processing.
+                        analysis_result = calculate_crystal_structure(
+                            peaks_2theta
+                        )
+
+                        # Step 3: persist this run to SQLite, same as
+                        # the image-based flow.
+                        serialized_peaks = json.dumps(peaks_2theta)
+                        serialized_ratios = json.dumps(
+                            analysis_result["sin2_ratios"]
+                        )
+
+                        insert_calculation(
+                            common_value=analysis_result["common_value"],
+                            ratios=serialized_ratios,
+                            structure=analysis_result["structure"],
+                            peaks=serialized_peaks,
+                        )
+
+                        # No image exists in manual mode; cache None so
+                        # the results display can detect this and skip
+                        # rendering st.image.
+                        st.session_state.analysis_result = analysis_result
+                        st.session_state.peaks_2theta = peaks_2theta
+                        st.session_state.image_bytes = None
+
+                        st.success(
+                            "Manual analysis complete and saved to history."
+                        )
+
+                    except ValueError as processing_error:
+                        # Raised by calculate_crystal_structure on
+                        # non-physical input (e.g. sin(theta) <= 0).
+                        st.error(
+                            f"Could not analyze these values: "
+                            f"{processing_error}"
+                        )
+                    except sqlite3.Error as db_error:
+                        st.error(
+                            "Analysis succeeded, but saving to history "
+                            f"failed: {db_error}"
+                        )
+                    except Exception as unexpected_error:  # noqa: BLE001
+                        st.error(
+                            f"An unexpected error occurred: "
+                            f"{unexpected_error}"
+                        )
+
+        elif uploaded_file is None:
             st.warning("Please upload a diffractogram image before analyzing.")
         elif axis_end <= axis_start:
             st.error(
@@ -833,7 +959,7 @@ if __name__ == "__main__":
                 # Streamlit traceback.
                 st.error(f"An unexpected error occurred: {unexpected_error}")
 
-    # --- 8. Results display ---------------------------------------------
+    # --- 9. Results display ---------------------------------------------
     # Rendered from session_state (not from local variables scoped to
     # the button-click branch above), so results remain visible on
     # screen even after the script reruns for an unrelated reason (e.g.
@@ -846,8 +972,21 @@ if __name__ == "__main__":
         col_image, col_metrics = st.columns([1, 1])
 
         with col_image:
-            st.subheader("Uploaded Diffractogram")
-            st.image(cached_image_bytes, use_container_width=True)
+            if cached_image_bytes is not None:
+                # Normal mode: an uploaded diffractogram image exists.
+                st.subheader("Uploaded Diffractogram")
+                st.image(cached_image_bytes, use_container_width=True)
+            else:
+                # Verification Mode: peaks were typed in manually, so
+                # there is no image to display. Show the raw input
+                # values instead, to make clear this run bypassed
+                # image processing entirely.
+                st.subheader("Manual Peak Input")
+                st.caption(
+                    "No image was processed -- these 2-Theta values "
+                    "were entered directly."
+                )
+                st.write(peaks_2theta)
 
         with col_metrics:
             st.subheader("Analysis Results")
