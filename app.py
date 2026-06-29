@@ -4,21 +4,25 @@ XRD Crystallography Streamlit App
 Step 1: Imports and core image-processing function (`extract_peaks`).
 Step 2: Crystallography physics (`calculate_crystal_structure`).
 Step 3: SQLite persistence (`init_db`, `insert_calculation`).
+Step 4: Streamlit UI (under `if __name__ == "__main__":`).
 
-NOTE: This file intentionally does NOT yet contain the Streamlit UI.
+This is the final, complete single-file application.
 """
 
 from __future__ import annotations
 
 # --- Standard library ---
+import json
 import math
 import sqlite3
 from datetime import datetime
 from typing import Dict, List, Union
 
 # --- Third-party libraries ---
-import numpy as np
 import cv2  # opencv-python-headless: image decoding + preprocessing
+import numpy as np
+import pandas as pd
+import streamlit as st
 from scipy.signal import find_peaks
 
 
@@ -594,3 +598,149 @@ def insert_calculation(
         # Always release the connection, even if an error occurred
         # above, to avoid leaving the database file locked.
         connection.close()
+
+
+# =============================================================================
+# Streamlit UI (Step 4)
+# =============================================================================
+# Everything below this point is presentation/orchestration logic only.
+# No new image-processing, physics, or database logic is introduced here --
+# this section exclusively wires together `extract_peaks`,
+# `calculate_crystal_structure`, `init_db`, and `insert_calculation`.
+# =============================================================================
+
+if __name__ == "__main__":
+    # --- 1. Page configuration -------------------------------------------
+    # Must be the first Streamlit call in the script per Streamlit's API
+    # rules (it configures the page before any other widget renders).
+    st.set_page_config(layout="wide", page_title="XRD Crystal Analyzer")
+
+    # --- 2. Initialize the database at the very start of the app run ----
+    # Wrapped in a try/except so a database/filesystem problem surfaces
+    # as a clear in-app error rather than crashing the whole script.
+    try:
+        init_db()
+    except sqlite3.Error as db_init_error:
+        st.error(f"Failed to initialize the database: {db_init_error}")
+        st.stop()
+
+    # --- 4. Sidebar: title, description, and file uploader ---------------
+    with st.sidebar:
+        st.title("XRD Crystal Analyzer")
+        st.write(
+            "Upload an image of an X-ray diffraction (XRD) pattern to "
+            "automatically detect peaks, compute d-spacings via Bragg's "
+            "Law, and identify the likely cubic crystal structure "
+            "(SC, BCC, or FCC)."
+        )
+        uploaded_file = st.file_uploader(
+            "Upload a diffractogram image",
+            type=["png", "jpg", "jpeg"],
+        )
+
+    st.title("XRD Crystal Analyzer")
+
+    # --- 5. Main flow: only runs once a file has been uploaded -----------
+    if uploaded_file is not None:
+        try:
+            # Read the uploaded file's raw bytes exactly once; reused
+            # both for processing and for the on-screen image preview.
+            image_bytes = uploaded_file.getvalue()
+
+            with st.spinner("Analyzing diffractogram..."):
+                # Step 1: locate peaks in the diffractogram image and
+                # map them to simulated 2-Theta positions.
+                peaks_2theta = extract_peaks(image_bytes)
+
+                if not peaks_2theta:
+                    st.warning(
+                        "No peaks were detected in this image. Try a "
+                        "clearer diffractogram with a visible dark "
+                        "curve on a light background."
+                    )
+                    st.stop()
+
+                # Step 2: run the physics -- Bragg's Law d-spacings and
+                # best-fit cubic structure classification.
+                analysis_result = calculate_crystal_structure(peaks_2theta)
+
+                # Step 3: persist this run to SQLite. Lists are
+                # JSON-serialized so they round-trip cleanly through the
+                # TEXT columns (as opposed to Python's `str(list)`,
+                # which is not reliably machine-parseable later).
+                serialized_peaks = json.dumps(peaks_2theta)
+                serialized_ratios = json.dumps(analysis_result["sin2_ratios"])
+
+                insert_calculation(
+                    common_value=analysis_result["common_value"],
+                    ratios=serialized_ratios,
+                    structure=analysis_result["structure"],
+                    peaks=serialized_peaks,
+                )
+
+            st.success("Analysis complete and saved to history.")
+
+            # --- 6. Results display -------------------------------------
+            col_image, col_metrics = st.columns([1, 1])
+
+            with col_image:
+                st.subheader("Uploaded Diffractogram")
+                st.image(image_bytes, use_container_width=True)
+
+            with col_metrics:
+                st.subheader("Analysis Results")
+
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                with metric_col1:
+                    st.metric("Crystal Structure", analysis_result["structure"])
+                with metric_col2:
+                    st.metric("Common Value", analysis_result["common_value"])
+                with metric_col3:
+                    st.metric("Peaks Found", len(peaks_2theta))
+
+                with st.expander("View detailed numeric results"):
+                    st.write("**2-Theta peaks (degrees):**", peaks_2theta)
+                    st.write("**d-spacings:**", analysis_result["d_spacings"])
+                    st.write("**sin² ratios:**", analysis_result["sin2_ratios"])
+                    st.write(
+                        "**Final integer sequence:**",
+                        analysis_result["final_integers"],
+                    )
+
+        except ValueError as processing_error:
+            # Raised by extract_peaks (bad image) or
+            # calculate_crystal_structure (non-physical input).
+            st.error(f"Could not analyze this image: {processing_error}")
+        except sqlite3.Error as db_error:
+            # Raised by insert_calculation if the save step fails.
+            st.error(f"Analysis succeeded, but saving to history failed: {db_error}")
+        except Exception as unexpected_error:  # noqa: BLE001
+            # Final safety net so an unanticipated failure still shows a
+            # clean message instead of an unhandled Streamlit traceback.
+            st.error(f"An unexpected error occurred: {unexpected_error}")
+    else:
+        st.info("Upload a diffractogram image from the sidebar to begin.")
+
+    # --- 7. History dashboard ---------------------------------------------
+    # Always rendered, regardless of whether a file was uploaded this run,
+    # so users can review past analyses at any time.
+    st.divider()
+    st.subheader("Calculation History")
+
+    try:
+        history_connection = sqlite3.connect(DB_FILENAME)
+        try:
+            history_df = pd.read_sql_query(
+                "SELECT * FROM history ORDER BY timestamp DESC",
+                history_connection,
+            )
+        finally:
+            history_connection.close()
+
+        if history_df.empty:
+            st.write("No calculations have been saved yet.")
+        else:
+            st.dataframe(history_df, use_container_width=True)
+
+    except sqlite3.Error as history_error:
+        st.error(f"Could not load calculation history: {history_error}")
