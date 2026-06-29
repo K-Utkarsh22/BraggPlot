@@ -26,7 +26,11 @@ import streamlit as st
 from scipy.signal import find_peaks
 
 
-def extract_peaks(image_bytes: bytes) -> list[float]:
+def extract_peaks(
+    image_bytes: bytes,
+    axis_min: float = 20.0,
+    axis_max: float = 80.0,
+) -> list[float]:
     """
     Extract simulated 2-Theta peak positions from an XRD pattern image.
 
@@ -36,7 +40,9 @@ def extract_peaks(image_bytes: bytes) -> list[float]:
     (peaks). It does this purely via image processing: there is no
     parsing of axis labels or tick marks, so the mapping from pixel
     columns to 2-Theta degrees is a LINEAR ASSUMPTION across the full
-    width of the image, spanning a fixed range of 20.0 to 80.0 degrees.
+    width of the image, spanning the caller-specified range from
+    `axis_min` to `axis_max` degrees (defaulting to 20.0-80.0, a common
+    XRD scan range, if not otherwise specified).
 
     Pipeline overview:
         1. Decode raw image bytes into a grayscale OpenCV image.
@@ -55,7 +61,7 @@ def extract_peaks(image_bytes: bytes) -> list[float]:
         4. Run `scipy.signal.find_peaks` on that 1D intensity-proxy
            signal to locate candidate peak columns.
         5. Linearly map each peak's pixel column (x-coordinate) to a
-           2-Theta value in the [20.0, 80.0] degree range.
+           2-Theta value in the [axis_min, axis_max] degree range.
         6. Return the sorted list of 2-Theta float values.
 
     Args:
@@ -63,25 +69,44 @@ def extract_peaks(image_bytes: bytes) -> list[float]:
             a plotted XRD pattern -- a single dark curve on a
             predominantly white/light background, with 2-Theta along
             the x-axis and intensity along the y-axis.
+        axis_min: The 2-Theta value (in degrees) corresponding to the
+            leftmost pixel column of the image (column 0). Defaults to
+            20.0 degrees.
+        axis_max: The 2-Theta value (in degrees) corresponding to the
+            rightmost pixel column of the image. Defaults to 80.0
+            degrees. Must be strictly greater than `axis_min`.
 
     Returns:
         list[float]: Sorted (ascending) list of detected peak positions,
             expressed as simulated 2-Theta values in degrees, constrained
-            to the assumed axis range of [20.0, 80.0].
+            to the caller-specified axis range of [axis_min, axis_max].
 
     Raises:
         ValueError: If `image_bytes` cannot be decoded into a valid image
-            by OpenCV (e.g. empty or corrupted data).
+            by OpenCV (e.g. empty or corrupted data), or if `axis_max` is
+            not strictly greater than `axis_min`.
 
     Notes / Limitations (by design at this stage):
-        - No real-world calibration of the 2-Theta axis is performed;
-          the 20.0-80.0 degree range is a simulated/assumed default.
+        - No automatic real-world calibration of the 2-Theta axis is
+          performed (e.g. no OCR of axis tick labels); `axis_min` and
+          `axis_max` are caller-supplied assumptions about what the
+          image's horizontal extent represents.
         - No crystallography math (Bragg's law, d-spacing, Miller
           indices, etc.) is performed here -- this function's sole job
           is pixel-to-angle peak extraction.
         - Threshold and `find_peaks` parameters are reasonable generic
           defaults, not tuned for any specific instrument or image style.
     """
+    # --- 0. Validate the caller-supplied axis range ---
+    # Since axis_min/axis_max are now user-controlled (e.g. from a
+    # Streamlit number_input), we guard against a degenerate or
+    # inverted range before doing any image work.
+    if axis_max <= axis_min:
+        raise ValueError(
+            f"extract_peaks: 'axis_max' ({axis_max}) must be strictly "
+            f"greater than 'axis_min' ({axis_min})."
+        )
+
     # --- 1. Decode raw bytes into a grayscale OpenCV image ---
     # np.frombuffer creates a 1D array view of the raw bytes without
     # copying; cv2.imdecode then interprets that buffer as an encoded
@@ -165,10 +190,11 @@ def extract_peaks(image_bytes: bytes) -> list[float]:
     )
 
     # --- 5. Map peak pixel columns (x-coordinates) to simulated 2-Theta ---
-    # Linear mapping: column 0 -> 20.0 degrees, column (width-1) -> 80.0
-    # degrees, with everything in between interpolated proportionally.
-    two_theta_min = 20.0
-    two_theta_max = 80.0
+    # Linear mapping: column 0 -> axis_min degrees, column (width-1) ->
+    # axis_max degrees, with everything in between interpolated
+    # proportionally.
+    two_theta_min = axis_min
+    two_theta_max = axis_max
     two_theta_range = two_theta_max - two_theta_min
 
     # Guard against division-by-zero on a pathological 1-pixel-wide image.
@@ -624,7 +650,7 @@ if __name__ == "__main__":
         st.error(f"Failed to initialize the database: {db_init_error}")
         st.stop()
 
-    # --- 4. Sidebar: title, description, and file uploader ---------------
+    # --- 4. Sidebar: title, description, file uploader, and axis calibration
     with st.sidebar:
         st.title("XRD Crystal Analyzer")
         st.write(
@@ -638,10 +664,38 @@ if __name__ == "__main__":
             type=["png", "jpg", "jpeg"],
         )
 
+        st.subheader("Axis Calibration")
+        st.caption(
+            "Set these to match the 2-Theta range shown on your "
+            "diffractogram's x-axis."
+        )
+        axis_start = st.number_input(
+            "Axis Start",
+            value=20.0,
+            step=1.0,
+            help="2-Theta value (degrees) at the left edge of the plot.",
+        )
+        axis_end = st.number_input(
+            "Axis End",
+            value=80.0,
+            step=1.0,
+            help="2-Theta value (degrees) at the right edge of the plot.",
+        )
+
     st.title("XRD Crystal Analyzer")
 
     # --- 5. Main flow: only runs once a file has been uploaded -----------
     if uploaded_file is not None:
+        # Validate the calibration inputs up front with a clean warning,
+        # rather than letting an invalid range surface as a raw
+        # ValueError traceback from extract_peaks.
+        if axis_end <= axis_start:
+            st.error(
+                "'Axis End' must be greater than 'Axis Start'. Please "
+                "adjust the calibration values in the sidebar."
+            )
+            st.stop()
+
         try:
             # Read the uploaded file's raw bytes exactly once; reused
             # both for processing and for the on-screen image preview.
@@ -649,8 +703,13 @@ if __name__ == "__main__":
 
             with st.spinner("Analyzing diffractogram..."):
                 # Step 1: locate peaks in the diffractogram image and
-                # map them to simulated 2-Theta positions.
-                peaks_2theta = extract_peaks(image_bytes)
+                # map them to simulated 2-Theta positions, using the
+                # user-calibrated axis range from the sidebar.
+                peaks_2theta = extract_peaks(
+                    image_bytes,
+                    axis_min=axis_start,
+                    axis_max=axis_end,
+                )
 
                 if not peaks_2theta:
                     st.warning(
