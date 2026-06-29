@@ -1,0 +1,15 @@
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Python Cache (keeps your repo clean)
+__pycache__/
+*.pyc
+
+# OS generated files (if you are on Mac)
+.DS_Store
+
+# Local Database (You don't want to push test data to the public internet)
+*.db
+*.sqlite3
