@@ -639,7 +639,14 @@ if __name__ == "__main__":
     # --- 1. Page configuration -------------------------------------------
     # Must be the first Streamlit call in the script per Streamlit's API
     # rules (it configures the page before any other widget renders).
-    st.set_page_config(layout="wide", page_title="XRD Crystal Analyzer")
+    # initial_sidebar_state="collapsed" keeps the sidebar tucked away by
+    # default, since it now holds nothing but optional history -- the
+    # main page is the intended focus of the app.
+    st.set_page_config(
+        layout="wide",
+        page_title="XRD Crystal Analyzer",
+        initial_sidebar_state="collapsed",
+    )
 
     # --- 2. Initialize the database at the very start of the app run ----
     # Wrapped in a try/except so a database/filesystem problem surfaces
@@ -650,52 +657,25 @@ if __name__ == "__main__":
         st.error(f"Failed to initialize the database: {db_init_error}")
         st.stop()
 
-    # --- 3. Sidebar -------------------------------------------------------
-    # Layout order (top to bottom): title -> file uploader ->
-    # axis calibration -> divider -> collapsed history expander.
-    # The main page is reserved entirely for the uploaded image and the
-    # analysis results, so all secondary controls/data live here.
+    # --- 3. Session state -------------------------------------------------
+    # Streamlit reruns the entire script on every widget interaction, so
+    # the analysis result from clicking "Analyze" must be cached in
+    # st.session_state to survive subsequent reruns (e.g. if the user
+    # later opens the History expander, which is itself a rerun-causing
+    # interaction). Without this, the results would vanish the instant
+    # any other widget on the page was touched.
+    if "analysis_result" not in st.session_state:
+        st.session_state.analysis_result = None
+    if "peaks_2theta" not in st.session_state:
+        st.session_state.peaks_2theta = None
+    if "image_bytes" not in st.session_state:
+        st.session_state.image_bytes = None
+
+    # --- 4. Sidebar ---------------------------------------------------
+    # Sidebar is now reserved STRICTLY for Calculation History, per the
+    # hero-layout redesign. No uploader, no axis inputs, no title here --
+    # everything actionable lives on the main page.
     with st.sidebar:
-        st.title("XRD Crystal Analyzer")
-        st.write(
-            "Upload an image of an X-ray diffraction (XRD) pattern to "
-            "automatically detect peaks, compute d-spacings via Bragg's "
-            "Law, and identify the likely cubic crystal structure "
-            "(SC, BCC, or FCC)."
-        )
-
-        # --- File uploader (first, since it's the primary action) ---
-        uploaded_file = st.file_uploader(
-            "Upload a diffractogram image",
-            type=["png", "jpg", "jpeg"],
-        )
-
-        # --- Axis calibration (directly below the uploader) ---
-        st.subheader("Axis Calibration")
-        st.caption(
-            "Set these to match the 2-Theta range shown on your "
-            "diffractogram's x-axis."
-        )
-        axis_start = st.number_input(
-            "Axis Start",
-            value=20.0,
-            step=1.0,
-            help="2-Theta value (degrees) at the left edge of the plot.",
-        )
-        axis_end = st.number_input(
-            "Axis End",
-            value=80.0,
-            step=1.0,
-            help="2-Theta value (degrees) at the right edge of the plot.",
-        )
-
-        st.divider()
-
-        # --- Calculation History (collapsed, at the bottom of the sidebar)
-        # Tucked into an expander so it doesn't dominate the sidebar by
-        # default; the user opts in to viewing it. Rendered unconditionally
-        # (independent of whether a file was uploaded this run) so past
-        # analyses are always reachable.
         with st.expander("View History"):
             try:
                 history_connection = sqlite3.connect(DB_FILENAME)
@@ -715,100 +695,178 @@ if __name__ == "__main__":
             except sqlite3.Error as history_error:
                 st.error(f"Could not load calculation history: {history_error}")
 
-    # --- 4. Main page: reserved for the uploaded image and results -------
-    st.title("XRD Crystal Analyzer")
+    # --- 5. Main page: hero header -----------------------------------
+    # Centered title/subtitle using a 3-column trick (wide side columns
+    # squeeze the title into the middle), giving a "hero" feel rather
+    # than a plain left-aligned heading.
+    hero_left, hero_center, hero_right = st.columns([1, 2, 1])
+    with hero_center:
+        st.title("XRD Crystal Analyzer")
+        st.write(
+            "Upload an X-ray diffraction (XRD) pattern image to detect "
+            "peaks, compute d-spacings via Bragg's Law, and identify the "
+            "likely cubic crystal structure (SC, BCC, or FCC)."
+        )
 
-    if uploaded_file is not None:
-        # Validate the calibration inputs up front with a clean warning,
-        # rather than letting an invalid range surface as a raw
-        # ValueError traceback from extract_peaks.
-        if axis_end <= axis_start:
+    st.divider()
+
+    # --- 6. Main page: control bar (uploader + axis inputs + button) -
+    # This row acts as a persistent "top bar": once results are shown,
+    # this same row stays put at the top of the page rather than being
+    # replaced, so the user can immediately re-calibrate and re-analyze
+    # without scrolling back up or losing context.
+    control_upload, control_start, control_end, control_button = st.columns(
+        [3, 1, 1, 1]
+    )
+
+    with control_upload:
+        uploaded_file = st.file_uploader(
+            "Upload a diffractogram image",
+            type=["png", "jpg", "jpeg"],
+            label_visibility="collapsed",
+            help="Upload a PNG/JPG/JPEG image of an XRD diffractogram.",
+        )
+
+    with control_start:
+        axis_start = st.number_input(
+            "Axis Start",
+            value=20.0,
+            step=1.0,
+            help="2-Theta value (degrees) at the left edge of the plot.",
+        )
+
+    with control_end:
+        axis_end = st.number_input(
+            "Axis End",
+            value=80.0,
+            step=1.0,
+            help="2-Theta value (degrees) at the right edge of the plot.",
+        )
+
+    with control_button:
+        # A little vertical spacing so the button lines up with the
+        # number inputs instead of their labels.
+        st.write("")
+        analyze_clicked = st.button("Analyze", type="primary", use_container_width=True)
+
+    st.divider()
+
+    # --- 7. Analysis trigger -------------------------------------------
+    # Analysis now runs ONLY when the "Analyze" button is explicitly
+    # clicked (previously it ran automatically the instant a file was
+    # uploaded). This is a deliberate behavior change to match the new
+    # explicit-button control bar -- flagging it clearly since it
+    # differs from every prior version of this app.
+    if analyze_clicked:
+        if uploaded_file is None:
+            st.warning("Please upload a diffractogram image before analyzing.")
+        elif axis_end <= axis_start:
             st.error(
                 "'Axis End' must be greater than 'Axis Start'. Please "
-                "adjust the calibration values in the sidebar."
+                "adjust the calibration values above."
             )
-            st.stop()
+        else:
+            try:
+                # Read the uploaded file's raw bytes exactly once; reused
+                # both for processing and for the on-screen image preview.
+                image_bytes = uploaded_file.getvalue()
 
-        try:
-            # Read the uploaded file's raw bytes exactly once; reused
-            # both for processing and for the on-screen image preview.
-            image_bytes = uploaded_file.getvalue()
-
-            with st.spinner("Analyzing diffractogram..."):
-                # Step 1: locate peaks in the diffractogram image and
-                # map them to simulated 2-Theta positions, using the
-                # user-calibrated axis range from the sidebar.
-                peaks_2theta = extract_peaks(
-                    image_bytes,
-                    axis_min=axis_start,
-                    axis_max=axis_end,
-                )
-
-                if not peaks_2theta:
-                    st.warning(
-                        "No peaks were detected in this image. Try a "
-                        "clearer diffractogram with a visible dark "
-                        "curve on a light background."
-                    )
-                    st.stop()
-
-                # Step 2: run the physics -- Bragg's Law d-spacings and
-                # best-fit cubic structure classification.
-                analysis_result = calculate_crystal_structure(peaks_2theta)
-
-                # Step 3: persist this run to SQLite. Lists are
-                # JSON-serialized so they round-trip cleanly through the
-                # TEXT columns (as opposed to Python's `str(list)`,
-                # which is not reliably machine-parseable later).
-                serialized_peaks = json.dumps(peaks_2theta)
-                serialized_ratios = json.dumps(analysis_result["sin2_ratios"])
-
-                insert_calculation(
-                    common_value=analysis_result["common_value"],
-                    ratios=serialized_ratios,
-                    structure=analysis_result["structure"],
-                    peaks=serialized_peaks,
-                )
-
-            st.success("Analysis complete and saved to history.")
-
-            # --- Results display: image + metrics columns ---------------
-            col_image, col_metrics = st.columns([1, 1])
-
-            with col_image:
-                st.subheader("Uploaded Diffractogram")
-                st.image(image_bytes, use_container_width=True)
-
-            with col_metrics:
-                st.subheader("Analysis Results")
-
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-                with metric_col1:
-                    st.metric("Crystal Structure", analysis_result["structure"])
-                with metric_col2:
-                    st.metric("Common Value", analysis_result["common_value"])
-                with metric_col3:
-                    st.metric("Peaks Found", len(peaks_2theta))
-
-                with st.expander("View detailed numeric results"):
-                    st.write("**2-Theta peaks (degrees):**", peaks_2theta)
-                    st.write("**d-spacings:**", analysis_result["d_spacings"])
-                    st.write("**sin² ratios:**", analysis_result["sin2_ratios"])
-                    st.write(
-                        "**Final integer sequence:**",
-                        analysis_result["final_integers"],
+                with st.spinner("Analyzing diffractogram..."):
+                    # Step 1: locate peaks in the diffractogram image and
+                    # map them to simulated 2-Theta positions, using the
+                    # user-calibrated axis range from the control bar.
+                    peaks_2theta = extract_peaks(
+                        image_bytes,
+                        axis_min=axis_start,
+                        axis_max=axis_end,
                     )
 
-        except ValueError as processing_error:
-            # Raised by extract_peaks (bad image) or
-            # calculate_crystal_structure (non-physical input).
-            st.error(f"Could not analyze this image: {processing_error}")
-        except sqlite3.Error as db_error:
-            # Raised by insert_calculation if the save step fails.
-            st.error(f"Analysis succeeded, but saving to history failed: {db_error}")
-        except Exception as unexpected_error:  # noqa: BLE001
-            # Final safety net so an unanticipated failure still shows a
-            # clean message instead of an unhandled Streamlit traceback.
-            st.error(f"An unexpected error occurred: {unexpected_error}")
+                    if not peaks_2theta:
+                        st.warning(
+                            "No peaks were detected in this image. Try a "
+                            "clearer diffractogram with a visible dark "
+                            "curve on a light background."
+                        )
+                        st.session_state.analysis_result = None
+                        st.session_state.peaks_2theta = None
+                        st.session_state.image_bytes = None
+                        st.stop()
+
+                    # Step 2: run the physics -- Bragg's Law d-spacings
+                    # and best-fit cubic structure classification.
+                    analysis_result = calculate_crystal_structure(peaks_2theta)
+
+                    # Step 3: persist this run to SQLite. Lists are
+                    # JSON-serialized so they round-trip cleanly through
+                    # the TEXT columns.
+                    serialized_peaks = json.dumps(peaks_2theta)
+                    serialized_ratios = json.dumps(analysis_result["sin2_ratios"])
+
+                    insert_calculation(
+                        common_value=analysis_result["common_value"],
+                        ratios=serialized_ratios,
+                        structure=analysis_result["structure"],
+                        peaks=serialized_peaks,
+                    )
+
+                # Cache results in session_state so they persist below
+                # the control bar across reruns, instead of only
+                # existing transiently within this `if` block.
+                st.session_state.analysis_result = analysis_result
+                st.session_state.peaks_2theta = peaks_2theta
+                st.session_state.image_bytes = image_bytes
+
+                st.success("Analysis complete and saved to history.")
+
+            except ValueError as processing_error:
+                # Raised by extract_peaks (bad image) or
+                # calculate_crystal_structure (non-physical input).
+                st.error(f"Could not analyze this image: {processing_error}")
+            except sqlite3.Error as db_error:
+                # Raised by insert_calculation if the save step fails.
+                st.error(
+                    f"Analysis succeeded, but saving to history failed: {db_error}"
+                )
+            except Exception as unexpected_error:  # noqa: BLE001
+                # Final safety net so an unanticipated failure still
+                # shows a clean message instead of an unhandled
+                # Streamlit traceback.
+                st.error(f"An unexpected error occurred: {unexpected_error}")
+
+    # --- 8. Results display ---------------------------------------------
+    # Rendered from session_state (not from local variables scoped to
+    # the button-click branch above), so results remain visible on
+    # screen even after the script reruns for an unrelated reason (e.g.
+    # the user toggling the History expander).
+    if st.session_state.analysis_result is not None:
+        analysis_result = st.session_state.analysis_result
+        peaks_2theta = st.session_state.peaks_2theta
+        cached_image_bytes = st.session_state.image_bytes
+
+        col_image, col_metrics = st.columns([1, 1])
+
+        with col_image:
+            st.subheader("Uploaded Diffractogram")
+            st.image(cached_image_bytes, use_container_width=True)
+
+        with col_metrics:
+            st.subheader("Analysis Results")
+
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            with metric_col1:
+                st.metric("Crystal Structure", analysis_result["structure"])
+            with metric_col2:
+                st.metric("Common Value", analysis_result["common_value"])
+            with metric_col3:
+                st.metric("Peaks Found", len(peaks_2theta))
+
+            with st.expander("View detailed numeric results"):
+                st.write("**2-Theta peaks (degrees):**", peaks_2theta)
+                st.write("**d-spacings:**", analysis_result["d_spacings"])
+                st.write("**sin² ratios:**", analysis_result["sin2_ratios"])
+                st.write(
+                    "**Final integer sequence:**",
+                    analysis_result["final_integers"],
+                )
     else:
-        st.info("Upload a diffractogram image from the sidebar to begin.")
+        st.info("Upload a diffractogram image and click **Analyze** to begin.")
