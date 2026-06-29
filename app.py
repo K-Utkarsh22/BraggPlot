@@ -11,7 +11,8 @@ Bragg's law, d-spacing), and no database code has been added yet.
 from __future__ import annotations
 
 # --- Standard library ---
-from typing import List
+import math
+from typing import Dict, List, Union
 
 # --- Third-party libraries ---
 import numpy as np
@@ -174,3 +175,269 @@ def extract_peaks(image_bytes: bytes) -> list[float]:
 
     # --- 6. Return sorted ascending list of 2-Theta peak positions ---
     return sorted(two_theta_values)
+
+
+def calculate_crystal_structure(
+    peaks_2theta: List[float],
+    wavelength: float = 1.5406,
+) -> Dict[str, Union[List[float], List[int], int, str]]:
+    """
+    Derive d-spacings and infer the cubic crystal structure from a set
+    of XRD 2-Theta peak positions, using Bragg's Law and the sin^2(theta)
+    ratio method, with a multi-candidate best-fit search against all
+    three cubic Bravais lattices (SC, BCC, FCC).
+
+    Background (cubic-system indexing method):
+        For a cubic crystal system, sin^2(theta) for each reflection is
+        proportional to (h^2 + k^2 + l^2), where h, k, l are the Miller
+        indices of that reflection. Normalizing every peak's sin^2(theta)
+        by the SMALLEST sin^2(theta) in the pattern gives a set of
+        ratios that, after multiplying by a suitable small integer
+        ("common value"), should collapse onto a sequence of whole
+        numbers matching one of the canonical (h^2+k^2+l^2) sequences
+        below.
+
+    IMPORTANT -- why this version differs from a naive "first multiplier
+    that looks like an integer" approach: BCC's canonical sequence
+    [2, 4, 6, 8, 10, 12, ...] is exactly double SC's canonical sequence
+    [1, 2, 3, 4, 5, 6, ...]. This means a true BCC pattern, once
+    normalized by its smallest sin^2(theta), ALREADY looks like perfect
+    integers at multiplier=1 (i.e. [1, 2, 3, 4, 5, 6]) -- which is
+    indistinguishable from SC unless you deliberately also test
+    multiplier=2 and compare against BCC's actual reference sequence.
+    To avoid this misclassification, this function does NOT stop at the
+    first "integer-looking" multiplier. Instead it:
+        - Tries every multiplier in a fixed candidate range (1 to 10).
+        - For EACH multiplier, scales the normalized ratios, rounds them,
+          and compares the result against ALL three reference sequences
+          (SC, BCC, FCC).
+        - Computes a normalized error metric per (multiplier, structure)
+          combination, based on how far the scaled ratios land from
+          whole numbers AND from the specific integers in that
+          structure's reference sequence.
+        - Picks whichever (multiplier, structure) combination has the
+          lowest overall error -- i.e. the best global fit, not the
+          first acceptable one.
+
+    Steps performed:
+        1. Convert each 2-Theta peak (in degrees) to theta in radians:
+           theta_deg = 2theta / 2;  theta_rad = radians(theta_deg).
+        2. Apply Bragg's Law to compute the interplanar spacing d for
+           each peak: d = wavelength / (2 * sin(theta_rad)).
+        3. Compute sin^2(theta) for each peak and normalize all values
+           by dividing by the smallest sin^2(theta) in the set.
+        4. For multipliers 1 through 10, and for each of the three
+           reference lattice sequences (SC, BCC, FCC):
+             a. Scale the normalized ratios by the multiplier.
+             b. Round each scaled ratio to the nearest integer.
+             c. Compare those rounded integers against the reference
+                sequence (truncated to however many peaks we have) and
+                compute a match-error score combining (i) how far the
+                scaled values are from whole numbers in the first place,
+                and (ii) how far the rounded integers are from the
+                reference sequence's actual values.
+        5. Select the (multiplier, structure) pair with the lowest
+           error score across the entire search grid. This becomes the
+           reported 'common_value' and 'structure'.
+        6. If even the best-fitting combination's error exceeds a
+           reasonable tolerance, the structure is reported as 'Unknown'
+           rather than forcing a low-confidence label.
+
+    Args:
+        peaks_2theta: List of 2-Theta peak positions in degrees, as
+            produced by `extract_peaks`. Must contain at least one
+            value; values are expected to be positive and less than
+            180 degrees.
+        wavelength: X-ray wavelength in Angstroms used in Bragg's Law.
+            Defaults to 1.5406 Angstroms, the standard Cu-K(alpha1)
+            wavelength commonly used in lab XRD instruments.
+
+    Returns:
+        Dict[str, Union[List[float], List[int], int, str]]: A dictionary
+        with the following keys:
+            - 'd_spacings' (List[float]): Bragg's Law d-spacing for each
+              input peak, in the same order as the input.
+            - 'sin2_ratios' (List[float]): sin^2(theta) values for each
+              peak, normalized against the smallest sin^2(theta) in the
+              set, in the same order as the input (multiplier = 1,
+              i.e. the raw ratios prior to best-fit scaling).
+            - 'common_value' (int): The integer multiplier (from the
+              1-10 candidate range) that produced the best overall fit
+              to a reference lattice sequence.
+            - 'final_integers' (List[int]): The normalized ratios,
+              scaled by 'common_value' and rounded to the nearest
+              integer -- the best-fit (h^2 + k^2 + l^2) sequence.
+            - 'structure' (str): One of 'SC', 'BCC', 'FCC', or 'Unknown'
+              -- whichever produced the lowest match-error score, or
+              'Unknown' if no candidate met the tolerance.
+
+    Raises:
+        ValueError: If `peaks_2theta` is empty, or if any 2-Theta value
+            results in a non-physical theta (e.g. sin(theta) <= 0,
+            which would make Bragg's Law undefined/divide-by-zero).
+
+    Notes / Limitations:
+        - This method assumes a CUBIC crystal system. Non-cubic systems
+          (tetragonal, hexagonal, orthorhombic, etc.) will generally
+          score poorly against all three reference sequences and will
+          likely be reported as 'Unknown' even though they may be
+          perfectly valid crystals.
+        - Reference sequences are matched only against as many entries
+          as peaks were detected (a prefix/best-fit match), not a full
+          unit-cell derivation.
+        - No database lookups, plotting, or Streamlit UI are performed
+          in this function -- it is pure computation.
+    """
+    # --- Guard: require at least one peak to operate on ---
+    if not peaks_2theta:
+        raise ValueError(
+            "calculate_crystal_structure: 'peaks_2theta' must contain "
+            "at least one value."
+        )
+
+    # --- 1. Convert 2-Theta (degrees) -> theta (radians) ---
+    # Bragg's Law is defined in terms of theta (half the scattering
+    # angle), not the full 2-Theta angle measured by the instrument.
+    theta_degrees: List[float] = [two_theta / 2.0 for two_theta in peaks_2theta]
+    theta_radians: List[float] = [math.radians(td) for td in theta_degrees]
+
+    # --- 2. Bragg's Law: d = wavelength / (2 * sin(theta)) ---
+    d_spacings: List[float] = []
+    for theta_rad in theta_radians:
+        sin_theta = math.sin(theta_rad)
+        # sin(theta) must be strictly positive for Bragg's Law to be
+        # physically meaningful here; a zero or negative value would
+        # imply a non-physical 2-Theta peak (e.g. <= 0 degrees) and
+        # would cause a division-by-zero or a negative d-spacing.
+        if sin_theta <= 0:
+            raise ValueError(
+                "calculate_crystal_structure: encountered a 2-Theta "
+                "value that produces a non-positive sin(theta), which "
+                "is not physically valid for Bragg's Law."
+            )
+        d_spacings.append(wavelength / (2.0 * sin_theta))
+
+    # --- 3. sin^2(theta) ratios, normalized by the smallest value ---
+    sin2_theta: List[float] = [math.sin(tr) ** 2 for tr in theta_radians]
+    min_sin2 = min(sin2_theta)
+
+    # min_sin2 is guaranteed > 0 here since sin_theta was already
+    # validated to be > 0 for every peak above.
+    sin2_ratios: List[float] = [s2 / min_sin2 for s2 in sin2_theta]
+
+    # --- 4. Reference (h^2 + k^2 + l^2)-style sequences for each cubic ---
+    # --- Bravais lattice, as commonly tabulated in XRD indexing refs. ---
+    reference_sequences: Dict[str, List[int]] = {
+        "SC": [1, 2, 3, 4, 5, 6, 8, 9],
+        "BCC": [2, 4, 6, 8, 10, 12, 14, 16],
+        "FCC": [3, 4, 8, 11, 12, 16, 19, 20],
+    }
+
+    num_peaks = len(sin2_ratios)
+    min_multiplier_to_try = 1
+    max_multiplier_to_try = 10  # per spec: test candidate multipliers 1-10
+
+    # --- 5. Grid-search every (multiplier, structure) combination and ---
+    # --- score each one with a combined error metric, rather than ---
+    # --- accepting the first multiplier that merely "looks like" an ---
+    # --- integer (which is what caused the SC/BCC ambiguity earlier). ---
+
+    # A best-fit candidate must land this close (on average) to the
+    # reference sequence's integers to be accepted as a confident match;
+    # otherwise we report 'Unknown' rather than force a low-confidence
+    # label onto noisy or non-cubic data.
+    acceptance_tolerance = 0.12
+
+    # IMPORTANT TIE-BREAKING NOTE: SC's reference sequence
+    # [1, 2, 3, 4, 5, 6, 8, 9] is mathematically a strict subset of
+    # BCC's [2, 4, 6, 8, 10, 12, ...] divided by 2. This means a TRUE
+    # BCC pattern will produce a perfect (zero-error) match against SC
+    # at multiplier=1 AND a perfect (zero-error) match against BCC at
+    # multiplier=2, simultaneously. Plain "lowest error wins" is not
+    # sufficient here because both candidates score essentially equally
+    # well -- whichever is evaluated first would win by accident, which
+    # is exactly the bug we're fixing. To break ties correctly, we track
+    # ALL near-perfect candidates (within `tie_epsilon` of the best
+    # error found) and, among those, prefer the structure whose
+    # reference sequence is NOT a pure integer subset of a simpler
+    # pattern -- i.e. prefer BCC/FCC over SC whenever they are tied,
+    # since SC's sequence is the "trivially looks like integers"
+    # degenerate case that will always tie with a true BCC/FCC fit.
+    tie_epsilon = 1e-6
+    structure_priority = {"BCC": 0, "FCC": 0, "SC": 1, "Unknown": 2}
+
+    candidates: List[Dict[str, Union[int, str, float, List[int]]]] = []
+
+    for multiplier in range(min_multiplier_to_try, max_multiplier_to_try + 1):
+        # Scale the normalized ratios by this candidate multiplier.
+        scaled_ratios = [ratio * multiplier for ratio in sin2_ratios]
+        rounded_integers = [int(round(val)) for val in scaled_ratios]
+
+        # "Snap error": how far the scaled ratios are from ANY whole
+        # number in the first place (independent of which structure we
+        # compare against) -- a high snap error means this multiplier
+        # doesn't clear denominators well at all, regardless of lattice.
+        snap_error = sum(
+            abs(val - round(val)) for val in scaled_ratios
+        ) / num_peaks
+
+        for label, reference in reference_sequences.items():
+            # Compare rounded integers against this structure's
+            # reference sequence, truncated to however many peaks we
+            # actually have (can't match more reference entries than
+            # peaks detected).
+            reference_prefix = reference[:num_peaks]
+
+            # "Match error": how far the rounded integers are from this
+            # specific structure's expected sequence values.
+            match_error = sum(
+                abs(rounded_integers[i] - reference_prefix[i])
+                for i in range(len(reference_prefix))
+            ) / num_peaks
+
+            # Combined confidence/error score: both the raw closeness-
+            # to-integer (snap_error) and the closeness-to-this-specific-
+            # lattice (match_error) matter. Equal weighting keeps the
+            # metric simple and interpretable.
+            combined_error = snap_error + match_error
+
+            candidates.append({
+                "error": combined_error,
+                "structure": label,
+                "multiplier": multiplier,
+                "final_integers": rounded_integers,
+            })
+
+    # Find the single lowest error across the whole search grid.
+    best_error = min(c["error"] for c in candidates)
+
+    # Collect every candidate within `tie_epsilon` of that best error --
+    # on clean synthetic data, BCC (at its multiplier) and SC (at
+    # multiplier=1) will often BOTH appear here.
+    near_best = [c for c in candidates if c["error"] <= best_error + tie_epsilon]
+
+    # Among the near-best candidates, prefer BCC/FCC over SC (see note
+    # above), then prefer the smallest multiplier as a final tiebreaker
+    # for full determinism.
+    near_best.sort(
+        key=lambda c: (structure_priority.get(c["structure"], 2), c["multiplier"])
+    )
+    winner = near_best[0]
+
+    best_error = winner["error"]
+    best_structure = winner["structure"]
+    best_multiplier = winner["multiplier"]
+    best_final_integers = winner["final_integers"]
+
+    # --- 6. Reject low-confidence "best" matches rather than force one ---
+    if best_error > acceptance_tolerance:
+        best_structure = "Unknown"
+
+    # --- Assemble and return the result dictionary ---
+    return {
+        "d_spacings": d_spacings,
+        "sin2_ratios": sin2_ratios,
+        "common_value": best_multiplier,
+        "final_integers": best_final_integers,
+        "structure": best_structure,
+    }
