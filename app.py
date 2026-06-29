@@ -650,7 +650,11 @@ if __name__ == "__main__":
         st.error(f"Failed to initialize the database: {db_init_error}")
         st.stop()
 
-    # --- 4. Sidebar: title, description, file uploader, and axis calibration
+    # --- 3. Sidebar -------------------------------------------------------
+    # Layout order (top to bottom): title -> file uploader ->
+    # axis calibration -> divider -> collapsed history expander.
+    # The main page is reserved entirely for the uploaded image and the
+    # analysis results, so all secondary controls/data live here.
     with st.sidebar:
         st.title("XRD Crystal Analyzer")
         st.write(
@@ -659,11 +663,14 @@ if __name__ == "__main__":
             "Law, and identify the likely cubic crystal structure "
             "(SC, BCC, or FCC)."
         )
+
+        # --- File uploader (first, since it's the primary action) ---
         uploaded_file = st.file_uploader(
             "Upload a diffractogram image",
             type=["png", "jpg", "jpeg"],
         )
 
+        # --- Axis calibration (directly below the uploader) ---
         st.subheader("Axis Calibration")
         st.caption(
             "Set these to match the 2-Theta range shown on your "
@@ -682,9 +689,35 @@ if __name__ == "__main__":
             help="2-Theta value (degrees) at the right edge of the plot.",
         )
 
+        st.divider()
+
+        # --- Calculation History (collapsed, at the bottom of the sidebar)
+        # Tucked into an expander so it doesn't dominate the sidebar by
+        # default; the user opts in to viewing it. Rendered unconditionally
+        # (independent of whether a file was uploaded this run) so past
+        # analyses are always reachable.
+        with st.expander("View History"):
+            try:
+                history_connection = sqlite3.connect(DB_FILENAME)
+                try:
+                    history_df = pd.read_sql_query(
+                        "SELECT * FROM history ORDER BY timestamp DESC",
+                        history_connection,
+                    )
+                finally:
+                    history_connection.close()
+
+                if history_df.empty:
+                    st.write("No calculations have been saved yet.")
+                else:
+                    st.dataframe(history_df, use_container_width=True)
+
+            except sqlite3.Error as history_error:
+                st.error(f"Could not load calculation history: {history_error}")
+
+    # --- 4. Main page: reserved for the uploaded image and results -------
     st.title("XRD Crystal Analyzer")
 
-    # --- 5. Main flow: only runs once a file has been uploaded -----------
     if uploaded_file is not None:
         # Validate the calibration inputs up front with a clean warning,
         # rather than letting an invalid range surface as a raw
@@ -739,7 +772,7 @@ if __name__ == "__main__":
 
             st.success("Analysis complete and saved to history.")
 
-            # --- 6. Results display -------------------------------------
+            # --- Results display: image + metrics columns ---------------
             col_image, col_metrics = st.columns([1, 1])
 
             with col_image:
@@ -779,27 +812,3 @@ if __name__ == "__main__":
             st.error(f"An unexpected error occurred: {unexpected_error}")
     else:
         st.info("Upload a diffractogram image from the sidebar to begin.")
-
-    # --- 7. History dashboard ---------------------------------------------
-    # Always rendered, regardless of whether a file was uploaded this run,
-    # so users can review past analyses at any time.
-    st.divider()
-    st.subheader("Calculation History")
-
-    try:
-        history_connection = sqlite3.connect(DB_FILENAME)
-        try:
-            history_df = pd.read_sql_query(
-                "SELECT * FROM history ORDER BY timestamp DESC",
-                history_connection,
-            )
-        finally:
-            history_connection.close()
-
-        if history_df.empty:
-            st.write("No calculations have been saved yet.")
-        else:
-            st.dataframe(history_df, use_container_width=True)
-
-    except sqlite3.Error as history_error:
-        st.error(f"Could not load calculation history: {history_error}")
