@@ -1,17 +1,19 @@
 """
 XRD Crystallography Streamlit App
 -----------------------------------
-Step 1 of N: Imports and core image-processing function (`extract_peaks`).
+Step 1: Imports and core image-processing function (`extract_peaks`).
+Step 2: Crystallography physics (`calculate_crystal_structure`).
+Step 3: SQLite persistence (`init_db`, `insert_calculation`).
 
-NOTE: This file intentionally contains ONLY imports and `extract_peaks`
-at this stage. No Streamlit UI, no math/crystallography logic (e.g.
-Bragg's law, d-spacing), and no database code has been added yet.
+NOTE: This file intentionally does NOT yet contain the Streamlit UI.
 """
 
 from __future__ import annotations
 
 # --- Standard library ---
 import math
+import sqlite3
+from datetime import datetime
 from typing import Dict, List, Union
 
 # --- Third-party libraries ---
@@ -441,3 +443,154 @@ def calculate_crystal_structure(
         "final_integers": best_final_integers,
         "structure": best_structure,
     }
+
+
+# --- Database configuration ---
+# Centralized here so both DB functions stay in sync if the filename
+# ever needs to change.
+DB_FILENAME = "xrd_history.db"
+
+
+def init_db() -> None:
+    """
+    Initialize the local SQLite database used to persist XRD analysis
+    history.
+
+    Connects to the SQLite database file named by `DB_FILENAME`
+    (created automatically by sqlite3 if it does not already exist on
+    disk) and ensures a `history` table exists with the following
+    schema:
+
+        id            INTEGER PRIMARY KEY AUTOINCREMENT
+        timestamp     DATETIME
+        common_value  INTEGER
+        ratios        TEXT
+        structure     TEXT
+        peaks         TEXT
+
+    The table is created only if it does not already exist (via
+    `CREATE TABLE IF NOT EXISTS`), so calling this function multiple
+    times -- e.g. once per Streamlit app run/rerun -- is safe and will
+    never wipe or duplicate existing history rows.
+
+    Note on column types: `ratios` and `peaks` are stored as TEXT
+    rather than as native list/array columns, because SQLite has no
+    built-in array type. The intent is for callers (e.g.
+    `insert_calculation`) to serialize Python lists (such as
+    `sin2_ratios`, `final_integers`, or the original `peaks_2theta`
+    list) into a TEXT-compatible representation -- for example a
+    comma-separated string or a JSON-encoded string -- before storing
+    them, and to deserialize them back into lists when reading rows
+    back out.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        sqlite3.Error: If the connection to the database file cannot
+            be established, or if the `CREATE TABLE` statement fails
+            for any reason (e.g. disk I/O error, permissions issue).
+    """
+    # sqlite3.connect() will create the .db file on disk automatically
+    # if it does not already exist at this path.
+    connection = sqlite3.connect(DB_FILENAME)
+    try:
+        cursor = connection.cursor()
+
+        # IF NOT EXISTS makes this idempotent: safe to call on every
+        # app startup without disturbing any rows already saved from
+        # previous runs.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME,
+                common_value INTEGER,
+                ratios TEXT,
+                structure TEXT,
+                peaks TEXT
+            )
+            """
+        )
+
+        # Persist the schema change (CREATE TABLE) to disk.
+        connection.commit()
+    finally:
+        # Always release the connection, even if an error occurred
+        # above, to avoid leaving the database file locked.
+        connection.close()
+
+
+def insert_calculation(
+    common_value: int,
+    ratios: str,
+    structure: str,
+    peaks: str,
+) -> None:
+    """
+    Insert a single XRD analysis result as a new row into the `history`
+    table of the local SQLite database, stamped with the current
+    timestamp.
+
+    This function opens its own short-lived connection to
+    `DB_FILENAME`, inserts one row, commits the transaction, and closes
+    the connection -- it does not assume `init_db()` has already been
+    called within the same process, but it DOES assume the `history`
+    table already exists (e.g. because `init_db()` was called earlier
+    during app startup). If the table does not exist, this will raise
+    an `sqlite3.OperationalError`.
+
+    Args:
+        common_value: The integer multiplier (`common_value` from
+            `calculate_crystal_structure`'s result dictionary) that
+            produced the best-fit lattice match.
+        ratios: A string representation of the sin^2(theta) ratios (or
+            final integer sequence) for this analysis. Callers are
+            responsible for serializing their Python list into a
+            string (e.g. via `str(some_list)` or `json.dumps(some_list)`)
+            before passing it in, since SQLite's TEXT column stores
+            this verbatim.
+        structure: The identified crystal structure label, e.g. one of
+            `'SC'`, `'BCC'`, `'FCC'`, or `'Unknown'`.
+        peaks: A string representation of the original 2-Theta peak
+            positions (e.g. the list returned by `extract_peaks`,
+            serialized to a string by the caller) associated with this
+            analysis.
+
+    Returns:
+        None.
+
+    Raises:
+        sqlite3.Error: If the connection cannot be established, if the
+            `history` table does not exist, or if the `INSERT`
+            statement fails for any other reason.
+    """
+    # Capture the current local timestamp at the moment of insertion.
+    # Stored as an ISO-8601 string, which SQLite's DATETIME column type
+    # affinity will accept and which sorts/compares correctly as text.
+    current_timestamp = datetime.now().isoformat()
+
+    connection = sqlite3.connect(DB_FILENAME)
+    try:
+        cursor = connection.cursor()
+
+        # Parameterized query (the "?" placeholders) is used instead of
+        # an f-string/format() to avoid SQL injection and to let
+        # sqlite3 handle type adaptation correctly.
+        cursor.execute(
+            """
+            INSERT INTO history (timestamp, common_value, ratios, structure, peaks)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (current_timestamp, common_value, ratios, structure, peaks),
+        )
+
+        # Persist the inserted row to disk.
+        connection.commit()
+    finally:
+        # Always release the connection, even if an error occurred
+        # above, to avoid leaving the database file locked.
+        connection.close()
