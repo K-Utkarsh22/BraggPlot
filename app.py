@@ -5,8 +5,17 @@ Step 1: Imports and core image-processing function (`extract_peaks`).
 Step 2: Crystallography physics (`calculate_crystal_structure`).
 Step 3: SQLite persistence (`init_db`, `insert_calculation`).
 Step 4: Streamlit UI (under `if __name__ == "__main__":`).
+Step 5: Live Material Identification via the Materials Project API
+        (`identify_material_api`).
 
 This is the final, complete single-file application.
+
+REQUIREMENTS.TXT NOTE: Step 5 depends on the `mp-api` package (the
+Materials Project API client, imported as `mp_api.client`). Add
+`mp-api` to requirements.txt. It is NOT imported at module level here
+-- see `identify_material_api`'s docstring for why -- so the rest of
+this app continues to run even on a machine where `mp-api` is not
+installed.
 """
 
 from __future__ import annotations
@@ -24,6 +33,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy.signal import find_peaks
+
+# NOTE: `mp_api.client.MPRester` (Materials Project API) is deliberately
+# NOT imported here at module level. It is a heavier, optional
+# dependency that also requires network access and a valid API key.
+# Importing it lazily inside `identify_material_api` means the rest of
+# this app -- peak extraction, physics, SQLite history -- keeps working
+# even on a machine where `mp-api` hasn't been installed, and an
+# ImportError becomes a normal, catchable error inside that one
+# function rather than crashing the whole script at startup.
+
 
 
 def extract_peaks(
@@ -508,6 +527,191 @@ def calculate_crystal_structure(
     }
 
 
+def identify_material_api(
+    api_key: str,
+    a_param: float,
+    tolerance: float = 0.15,
+) -> list[dict]:
+    """
+    Search the live Materials Project database for cubic materials whose
+    theoretical lattice parameter `a` is close to a user-supplied value,
+    as a real-world identification step following the XRD analysis
+    pipeline above.
+
+    This function queries the Materials Project Summary endpoint via
+    the `mp_api.client.MPRester` client for materials with
+    `crystal_system == "Cubic"`, then filters those results down to the
+    ones whose lattice parameter `a` (in Angstroms) falls within
+    `[a_param - tolerance, a_param + tolerance]`.
+
+    IMPORTANT IMPLEMENTATION NOTE on filtering strategy: the Materials
+    Project summary `search()` endpoint does not expose a documented
+    server-side filter for a specific numeric lattice-parameter range
+    (it filters by things like `crystal_system`, `elements`,
+    `band_gap`, etc., but not `a` directly). Rather than guess at an
+    unconfirmed API parameter that might silently fail or raise at
+    request time, this function queries broadly by `crystal_system=
+    "Cubic"` (restricting the returned `fields` to keep the request
+    light) and performs the numeric `a_param +/- tolerance` filtering
+    CLIENT-SIDE, in Python, against each result's
+    `structure.lattice.a`. This is slower than a hypothetical
+    server-side range filter would be, and -- because the Materials
+    Project database contains a very large number of cubic entries --
+    this call may be slow or, in a worst case, heavy on API quota; see
+    the Limitations section below.
+
+    IMPORTANT NOTE on lazy import: `from mp_api.client import MPRester`
+    happens INSIDE this function, not at module level. `mp-api` is a
+    heavyweight optional dependency (it pulls in `pymatgen` and friends)
+    that also requires network access and a registered API key. Keeping
+    the import local means the rest of this application (image
+    processing, physics, SQLite history) continues to work even on a
+    machine where `mp-api` has not been installed -- only a call to
+    THIS function will fail, and it fails as a normal caught exception
+    rather than an import-time crash of the whole script.
+
+    Args:
+        api_key: A Materials Project API key (obtained for free from
+            https://materialsproject.org after registering). Must be a
+            non-empty string.
+        a_param: The theoretical lattice parameter `a` (in Angstroms)
+            to search around -- typically the `avg_lattice_parameter`
+            from the winning hypothesis in `calculate_crystal_structure`'s
+            output.
+        tolerance: How far (in Angstroms, plus or minus) a candidate
+            material's lattice parameter may differ from `a_param` and
+            still be considered a match. Defaults to 0.15 Angstroms.
+
+    Returns:
+        list[dict]: A list of match dictionaries, sorted ascending by
+            how close each material's lattice parameter is to
+            `a_param` (best match first). Each dictionary contains:
+                - 'formula' (str): The material's pretty chemical
+                  formula (e.g. 'Fe', 'NaCl').
+                - 'material_id' (str): The Materials Project ID (e.g.
+                  'mp-13').
+                - 'lattice_parameter_a' (float): The material's exact
+                  theoretical lattice parameter `a`, in Angstroms, as
+                  stored in the Materials Project database.
+                - 'delta' (float): The absolute difference between this
+                  material's `a` and the user's `a_param`, in
+                  Angstroms (smaller is a closer match).
+
+            On failure (missing/invalid API key, network error, the
+            `mp-api` package not being installed, or any other
+            unexpected error), returns a list containing a SINGLE
+            dictionary of the form {'error': '<human-readable message>'}
+            rather than raising -- callers should check for an 'error'
+            key in the first element before treating the result as a
+            list of material matches. If the query succeeds but no
+            materials fall within tolerance, an empty list (`[]`) is
+            returned instead (a genuinely empty result is NOT an
+            error).
+
+    Raises:
+        Nothing. This function is designed to be safe to call directly
+        from Streamlit UI code without an enclosing try/except --
+        all failure modes are caught internally and reported via the
+        return value, per the function's error-handling requirements.
+
+    Limitations:
+        - Client-side filtering (see note above) means this function
+          may need to fetch and inspect a large number of cubic
+          materials before finding matches; on a slow connection or
+          for a very large result set this call can take a long time.
+          A production version would ideally page through results or
+          impose a server-side numeric filter if/when the Materials
+          Project API exposes one for lattice parameters directly.
+        - Only `crystal_system == "Cubic"` materials are considered, in
+          keeping with the rest of this app's cubic-only assumption
+          (SC/BCC/FCC). Non-cubic matches are never returned, even if
+          their `a`-axis length happens to be numerically close.
+        - Deprecated/superseded Materials Project entries are not
+          explicitly excluded; some results may correspond to legacy
+          or non-canonical calculations for a given composition.
+    """
+    # --- Guard: a non-empty API key is required before attempting ---
+    # --- any network call. ---
+    if not api_key or not api_key.strip():
+        return [{"error": "No Materials Project API key was provided."}]
+
+    # --- Lazy import: see docstring note above for why this isn't a ---
+    # --- module-level import. ---
+    try:
+        from mp_api.client import MPRester
+    except ImportError:
+        return [{
+            "error": (
+                "The 'mp-api' package is not installed. Add 'mp-api' "
+                "to requirements.txt and install it to enable live "
+                "Materials Project search."
+            )
+        }]
+
+    a_min = a_param - tolerance
+    a_max = a_param + tolerance
+
+    try:
+        with MPRester(api_key) as mpr:
+            # Query broadly by crystal_system only -- there is no
+            # confirmed server-side filter for a specific lattice
+            # parameter range on this endpoint (see docstring). The
+            # `fields` list is restricted to the minimum needed
+            # (material_id, formula_pretty, structure) to keep the
+            # request as light as possible, since `structure` is
+            # itself a relatively large nested object.
+            docs = mpr.materials.summary.search(
+                crystal_system="Cubic",
+                fields=["material_id", "formula_pretty", "structure"],
+            )
+    except Exception as api_error:  # noqa: BLE001
+        # Catches authentication failures (invalid API key), network
+        # errors, timeouts, and any other failure from the MPRester
+        # client/HTTP layer. The Materials Project client does not
+        # document a single specific exception type for "bad API key"
+        # vs. "network down", so a broad catch here is intentional and
+        # is the safest way to guarantee this function never raises
+        # out to the caller, per the stated requirements.
+        return [{
+            "error": (
+                "Materials Project search failed (check your API key "
+                f"and network connection): {api_error}"
+            )
+        }]
+
+    # --- Client-side filtering by lattice parameter `a` -----------------
+    matches: List[Dict[str, Union[str, float]]] = []
+
+    for doc in docs:
+        try:
+            # doc.structure is a pymatgen Structure object; its
+            # .lattice.a attribute is the theoretical lattice parameter
+            # `a` in Angstroms for that material's stored structure.
+            structure = doc.structure
+            if structure is None:
+                continue
+
+            doc_a = float(structure.lattice.a)
+        except (AttributeError, TypeError, ValueError):
+            # Skip any result missing structure/lattice data rather
+            # than letting one malformed entry abort the whole search.
+            continue
+
+        if a_min <= doc_a <= a_max:
+            delta = abs(doc_a - a_param)
+            matches.append({
+                "formula": getattr(doc, "formula_pretty", "Unknown"),
+                "material_id": str(getattr(doc, "material_id", "Unknown")),
+                "lattice_parameter_a": doc_a,
+                "delta": delta,
+            })
+
+    # --- Sort by closeness to the user's calculated a_param ---
+    matches.sort(key=lambda m: m["delta"])
+
+    return matches
+
+
 # --- Database configuration ---
 # Centralized here so both DB functions stay in sync if the filename
 # ever needs to change.
@@ -705,10 +909,25 @@ if __name__ == "__main__":
         st.session_state.image_bytes = None
 
     # --- 4. Sidebar ---------------------------------------------------
-    # Sidebar is now reserved STRICTLY for Calculation History, per the
-    # hero-layout redesign. No uploader, no axis inputs, no title here --
-    # everything actionable lives on the main page.
+    # Sidebar now holds two things: the Materials Project API key input
+    # (Step 5) and Calculation History. No uploader, no axis inputs, no
+    # title here -- everything else actionable lives on the main page.
     with st.sidebar:
+        st.subheader("Materials Project Search")
+        mp_api_key = st.text_input(
+            "Materials Project API Key",
+            type="password",
+            help=(
+                "Get a free API key by registering at "
+                "materialsproject.org, then find it on your account "
+                "dashboard. Used to search the live Materials Project "
+                "database for materials matching your calculated "
+                "lattice parameter."
+            ),
+        )
+
+        st.divider()
+
         with st.expander("View History"):
             try:
                 history_connection = sqlite3.connect(DB_FILENAME)
@@ -1093,6 +1312,98 @@ if __name__ == "__main__":
                 "remains consistent across multiple peaks. Lower error "
                 "scores indicate a better fit."
             )
+
+            # --- Step 5: Materials Project live database search -------
+            # Lets the user confirm their best-fit structure against
+            # real materials in the Materials Project database, using
+            # the WINNING hypothesis's average lattice parameter as the
+            # search target.
+            st.subheader("Materials Project Database Search")
+
+            best_fit_label = analysis_result["best_fit"]
+
+            if not mp_api_key or not mp_api_key.strip():
+                # No key entered: explain what's needed, exactly as
+                # specified, rather than silently showing nothing.
+                st.info(
+                    "Enter a Materials Project API key in the sidebar "
+                    "to search the live database for material matches."
+                )
+            elif best_fit_label == "Unknown":
+                # A key was provided, but there's no winning hypothesis
+                # to search around -- searching would be meaningless
+                # without a specific lattice parameter to target.
+                st.info(
+                    "No confident structure match was found (best fit: "
+                    "'Unknown'), so there is no lattice parameter to "
+                    "search the Materials Project database with."
+                )
+            else:
+                # Find the winning hypothesis's own lattice parameter
+                # to use as the search target -- not just any
+                # hypothesis, specifically the one matching best_fit.
+                winning_hypothesis = next(
+                    (
+                        h
+                        for h in analysis_result["hypotheses"]
+                        if h["structure"] == best_fit_label
+                    ),
+                    None,
+                )
+
+                if winning_hypothesis is None:
+                    # Defensive fallback: should not happen given
+                    # best_fit is always derived from this same
+                    # hypotheses list, but avoids a crash if the
+                    # invariant is ever broken by a future change.
+                    st.warning(
+                        "Could not locate the winning hypothesis's "
+                        "lattice parameter for the database search."
+                    )
+                else:
+                    target_a = winning_hypothesis["avg_lattice_parameter"]
+
+                    with st.spinner("Searching database..."):
+                        material_matches = identify_material_api(
+                            api_key=mp_api_key,
+                            a_param=target_a,
+                        )
+
+                    if (
+                        len(material_matches) == 1
+                        and "error" in material_matches[0]
+                    ):
+                        # identify_material_api's documented failure
+                        # signal: a single dict with an 'error' key.
+                        st.error(material_matches[0]["error"])
+                    elif not material_matches:
+                        st.info(
+                            f"No materials found in the Materials "
+                            f"Project database within tolerance of "
+                            f"a = {target_a:.4f} Å for the {best_fit_label} "
+                            f"hypothesis."
+                        )
+                    else:
+                        matches_df = pd.DataFrame(
+                            [
+                                {
+                                    "Formula": m["formula"],
+                                    "Material ID": m["material_id"],
+                                    "Lattice Parameter a (Å)": round(
+                                        m["lattice_parameter_a"], 4
+                                    ),
+                                    "Δ from Calculated a (Å)": round(
+                                        m["delta"], 4
+                                    ),
+                                }
+                                for m in material_matches
+                            ]
+                        )
+                        st.dataframe(
+                            matches_df,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
             with st.expander("View detailed numeric results"):
                 st.write("**2-Theta peaks (degrees):**", peaks_2theta)
