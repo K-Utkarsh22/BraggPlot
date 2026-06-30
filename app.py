@@ -212,12 +212,25 @@ def extract_peaks(
 def calculate_crystal_structure(
     peaks_2theta: List[float],
     wavelength: float = 1.5406,
-) -> Dict[str, Union[List[float], List[int], int, str]]:
+) -> Dict[str, Union[List[float], List[Dict[str, Union[str, int, float, List[float], List[int]]]], str]]:
     """
-    Derive d-spacings and infer the cubic crystal structure from a set
-    of XRD 2-Theta peak positions, using Bragg's Law and the sin^2(theta)
-    ratio method, with a multi-candidate best-fit search against all
-    three cubic Bravais lattices (SC, BCC, FCC).
+    Derive d-spacings and evaluate ALL THREE cubic Bravais lattice
+    hypotheses (SC, BCC, FCC) from a set of XRD 2-Theta peak positions,
+    using Bragg's Law and the sin^2(theta) ratio method.
+
+    THIS IS A MULTI-HYPOTHESIS WORKBENCH, not a single-winner classifier.
+    Earlier versions of this function picked one "best" structure label
+    and discarded the rest. This version instead evaluates every
+    structure independently and returns a comparison table: for each of
+    SC, BCC, and FCC, it reports the best-fit integer sequence, an error
+    score (lower = better fit), and -- critically -- the theoretical
+    lattice parameter `a` computed from EVERY peak under that
+    structure's hypothesis. A genuinely correct structure should yield
+    a consistent `a` across all peaks; a wrong structure will usually
+    produce noisy, inconsistent `a` values (or fail to fit close
+    integers at all), even though SOME `a` value is still always
+    reported so the user can see *why* a structure fits poorly, not
+    just that it does.
 
     Background (cubic-system indexing method):
         For a cubic crystal system, sin^2(theta) for each reflection is
@@ -225,83 +238,83 @@ def calculate_crystal_structure(
         indices of that reflection. Normalizing every peak's sin^2(theta)
         by the SMALLEST sin^2(theta) in the pattern gives a set of
         ratios that, after multiplying by a suitable small integer
-        ("common value"), should collapse onto a sequence of whole
-        numbers matching one of the canonical (h^2+k^2+l^2) sequences
-        below.
+        ("common value" / multiplier), should collapse onto a sequence
+        of whole numbers matching one of the canonical (h^2+k^2+l^2)
+        sequences below -- IF that structure is the correct one.
 
-    IMPORTANT -- why this version differs from a naive "first multiplier
-    that looks like an integer" approach: BCC's canonical sequence
-    [2, 4, 6, 8, 10, 12, ...] is exactly double SC's canonical sequence
-    [1, 2, 3, 4, 5, 6, ...]. This means a true BCC pattern, once
-    normalized by its smallest sin^2(theta), ALREADY looks like perfect
-    integers at multiplier=1 (i.e. [1, 2, 3, 4, 5, 6]) -- which is
-    indistinguishable from SC unless you deliberately also test
-    multiplier=2 and compare against BCC's actual reference sequence.
-    To avoid this misclassification, this function does NOT stop at the
-    first "integer-looking" multiplier. Instead it:
-        - Tries every multiplier in a fixed candidate range (1 to 10).
-        - For EACH multiplier, scales the normalized ratios, rounds them,
-          and compares the result against ALL three reference sequences
-          (SC, BCC, FCC).
-        - Computes a normalized error metric per (multiplier, structure)
-          combination, based on how far the scaled ratios land from
-          whole numbers AND from the specific integers in that
-          structure's reference sequence.
-        - Picks whichever (multiplier, structure) combination has the
-          lowest overall error -- i.e. the best global fit, not the
-          first acceptable one.
+    Lattice parameter formula (per peak, per structure hypothesis):
+        a = (wavelength * sqrt(h^2 + k^2 + l^2)) / (2 * sin(theta))
+    where (h^2 + k^2 + l^2) is taken from the STRUCTURE'S REFERENCE
+    SEQUENCE at that peak's position (the theoretical value implied by
+    assuming this structure is correct), not from the peak's own
+    rounded/observed integer. This is what makes the per-peak `a`
+    values meaningful as a consistency check: if the hypothesis is
+    right, every peak should independently reconstruct nearly the same
+    `a`; if it's wrong, the reconstructed `a` values will disagree.
 
-    Steps performed:
-        1. Convert each 2-Theta peak (in degrees) to theta in radians:
-           theta_deg = 2theta / 2;  theta_rad = radians(theta_deg).
-        2. Apply Bragg's Law to compute the interplanar spacing d for
-           each peak: d = wavelength / (2 * sin(theta_rad)).
-        3. Compute sin^2(theta) for each peak and normalize all values
-           by dividing by the smallest sin^2(theta) in the set.
-        4. For multipliers 1 through 10, and for each of the three
-           reference lattice sequences (SC, BCC, FCC):
-             a. Scale the normalized ratios by the multiplier.
-             b. Round each scaled ratio to the nearest integer.
-             c. Compare those rounded integers against the reference
-                sequence (truncated to however many peaks we have) and
-                compute a match-error score combining (i) how far the
-                scaled values are from whole numbers in the first place,
-                and (ii) how far the rounded integers are from the
-                reference sequence's actual values.
-        5. Select the (multiplier, structure) pair with the lowest
-           error score across the entire search grid. This becomes the
-           reported 'common_value' and 'structure'.
-        6. If even the best-fitting combination's error exceeds a
-           reasonable tolerance, the structure is reported as 'Unknown'
-           rather than forcing a low-confidence label.
+    Steps performed (per structure hypothesis):
+        1. Convert each 2-Theta peak (in degrees) to theta in radians.
+        2. Apply Bragg's Law to compute d-spacing for each peak.
+        3. Compute sin^2(theta) for each peak, normalized by the
+           smallest sin^2(theta) in the set.
+        4. For multipliers 1 through 10, scale the normalized ratios,
+           round them, and compare against THIS structure's reference
+           sequence (truncated to however many peaks were detected),
+           scoring the fit with a combined error metric (closeness to
+           integers + closeness to the specific reference values).
+        5. Pick the multiplier with the lowest error for this
+           structure specifically (each structure gets its own
+           independently-optimized multiplier -- they are not forced
+           to share one).
+        6. Using that multiplier's reference integers as the assumed
+           (h^2+k^2+l^2) for each peak, compute a lattice parameter `a`
+           per peak via the formula above, then average them.
+
+    A single 'best_fit' label is also derived (using the same BCC/FCC-
+    over-SC tie-breaking logic from earlier versions of this function)
+    purely for simple database logging -- it is NOT the primary output
+    of this function anymore.
 
     Args:
         peaks_2theta: List of 2-Theta peak positions in degrees, as
-            produced by `extract_peaks`. Must contain at least one
-            value; values are expected to be positive and less than
-            180 degrees.
+            produced by `extract_peaks` or typed in manually. Must
+            contain at least one value; values are expected to be
+            positive and less than 180 degrees.
         wavelength: X-ray wavelength in Angstroms used in Bragg's Law.
             Defaults to 1.5406 Angstroms, the standard Cu-K(alpha1)
-            wavelength commonly used in lab XRD instruments.
+            wavelength.
 
     Returns:
-        Dict[str, Union[List[float], List[int], int, str]]: A dictionary
-        with the following keys:
-            - 'd_spacings' (List[float]): Bragg's Law d-spacing for each
-              input peak, in the same order as the input.
+        Dict with the following keys:
+            - 'd_spacings' (List[float]): Bragg's Law d-spacing for
+              each input peak, in the same order as the input.
             - 'sin2_ratios' (List[float]): sin^2(theta) values for each
-              peak, normalized against the smallest sin^2(theta) in the
-              set, in the same order as the input (multiplier = 1,
-              i.e. the raw ratios prior to best-fit scaling).
-            - 'common_value' (int): The integer multiplier (from the
-              1-10 candidate range) that produced the best overall fit
-              to a reference lattice sequence.
-            - 'final_integers' (List[int]): The normalized ratios,
-              scaled by 'common_value' and rounded to the nearest
-              integer -- the best-fit (h^2 + k^2 + l^2) sequence.
-            - 'structure' (str): One of 'SC', 'BCC', 'FCC', or 'Unknown'
-              -- whichever produced the lowest match-error score, or
-              'Unknown' if no candidate met the tolerance.
+              peak, normalized against the smallest sin^2(theta) in
+              the set, in the same order as the input.
+            - 'hypotheses' (List[Dict]): one dictionary per structure
+              (SC, BCC, FCC), each containing:
+                - 'structure' (str): 'SC', 'BCC', or 'FCC'.
+                - 'common_value' (int): this structure's own best-fit
+                  multiplier (independent of the other two structures).
+                - 'final_integers' (List[int]): the rounded
+                  (h^2+k^2+l^2) sequence implied by this structure's
+                  best multiplier.
+                - 'error_score' (float): the fit-quality metric for
+                  this structure (lower is better). Always present,
+                  even for a poor fit.
+                - 'lattice_parameters' (List[float]): the per-peak
+                  lattice parameter `a` (Angstroms) computed under
+                  this structure's hypothesis. Always fully populated
+                  -- one value per input peak -- regardless of fit
+                  quality, so the user can see the (likely
+                  inconsistent) `a` values that make a bad fit bad.
+                - 'avg_lattice_parameter' (float): the mean of
+                  'lattice_parameters' for this structure.
+            - 'best_fit' (str): One of 'SC', 'BCC', 'FCC', or 'Unknown'
+              -- a single convenience label (for database logging only)
+              indicating whichever structure scored the lowest error,
+              with the same BCC/FCC-over-SC tie-breaking applied as in
+              earlier versions of this function.
 
     Raises:
         ValueError: If `peaks_2theta` is empty, or if any 2-Theta value
@@ -309,14 +322,16 @@ def calculate_crystal_structure(
             which would make Bragg's Law undefined/divide-by-zero).
 
     Notes / Limitations:
-        - This method assumes a CUBIC crystal system. Non-cubic systems
-          (tetragonal, hexagonal, orthorhombic, etc.) will generally
-          score poorly against all three reference sequences and will
-          likely be reported as 'Unknown' even though they may be
-          perfectly valid crystals.
+        - This method assumes a CUBIC crystal system throughout.
         - Reference sequences are matched only against as many entries
           as peaks were detected (a prefix/best-fit match), not a full
           unit-cell derivation.
+        - `tie_epsilon` (used only for the convenience 'best_fit'
+          label) is set to 0.05 rather than a razor-thin tolerance, to
+          remain robust against the rounding noise introduced by
+          manually-typed 2-Theta values (e.g. via Verification Mode),
+          which would otherwise fall just outside a tighter tolerance
+          and silently default to the wrong tie-break winner.
         - No database lookups, plotting, or Streamlit UI are performed
           in this function -- it is pure computation.
     """
@@ -335,6 +350,7 @@ def calculate_crystal_structure(
 
     # --- 2. Bragg's Law: d = wavelength / (2 * sin(theta)) ---
     d_spacings: List[float] = []
+    sin_thetas: List[float] = []
     for theta_rad in theta_radians:
         sin_theta = math.sin(theta_rad)
         # sin(theta) must be strictly positive for Bragg's Law to be
@@ -347,10 +363,11 @@ def calculate_crystal_structure(
                 "value that produces a non-positive sin(theta), which "
                 "is not physically valid for Bragg's Law."
             )
+        sin_thetas.append(sin_theta)
         d_spacings.append(wavelength / (2.0 * sin_theta))
 
     # --- 3. sin^2(theta) ratios, normalized by the smallest value ---
-    sin2_theta: List[float] = [math.sin(tr) ** 2 for tr in theta_radians]
+    sin2_theta: List[float] = [st ** 2 for st in sin_thetas]
     min_sin2 = min(sin2_theta)
 
     # min_sin2 is guaranteed > 0 here since sin_theta was already
@@ -367,111 +384,127 @@ def calculate_crystal_structure(
 
     num_peaks = len(sin2_ratios)
     min_multiplier_to_try = 1
-    max_multiplier_to_try = 10  # per spec: test candidate multipliers 1-10
+    max_multiplier_to_try = 10  # test candidate multipliers 1-10
 
-    # --- 5. Grid-search every (multiplier, structure) combination and ---
-    # --- score each one with a combined error metric, rather than ---
-    # --- accepting the first multiplier that merely "looks like" an ---
-    # --- integer (which is what caused the SC/BCC ambiguity earlier). ---
+    # --- 5. For EACH structure independently, grid-search multipliers ---
+    # --- 1-10 and keep that structure's own best (lowest-error) fit. ---
+    # Unlike earlier versions, structures are no longer forced to
+    # compete for a single global winner here -- each gets its own
+    # best multiplier, since the whole point of the workbench is to
+    # show all three hypotheses side by side.
+    hypotheses: List[Dict[str, Union[str, int, float, List[float], List[int]]]] = []
 
-    # A best-fit candidate must land this close (on average) to the
-    # reference sequence's integers to be accepted as a confident match;
-    # otherwise we report 'Unknown' rather than force a low-confidence
-    # label onto noisy or non-cubic data.
-    acceptance_tolerance = 0.12
+    # Also track every (multiplier, structure) candidate's error so we
+    # can derive the single 'best_fit' convenience label afterward using
+    # the same cross-structure tie-breaking logic as before.
+    all_candidates: List[Dict[str, Union[int, str, float, List[int]]]] = []
 
-    # IMPORTANT TIE-BREAKING NOTE: SC's reference sequence
-    # [1, 2, 3, 4, 5, 6, 8, 9] is mathematically a strict subset of
-    # BCC's [2, 4, 6, 8, 10, 12, ...] divided by 2. This means a TRUE
-    # BCC pattern will produce a perfect (zero-error) match against SC
-    # at multiplier=1 AND a perfect (zero-error) match against BCC at
-    # multiplier=2, simultaneously. Plain "lowest error wins" is not
-    # sufficient here because both candidates score essentially equally
-    # well -- whichever is evaluated first would win by accident, which
-    # is exactly the bug we're fixing. To break ties correctly, we track
-    # ALL near-perfect candidates (within `tie_epsilon` of the best
-    # error found) and, among those, prefer the structure whose
-    # reference sequence is NOT a pure integer subset of a simpler
-    # pattern -- i.e. prefer BCC/FCC over SC whenever they are tied,
-    # since SC's sequence is the "trivially looks like integers"
-    # degenerate case that will always tie with a true BCC/FCC fit.
-    tie_epsilon = 1e-6
-    structure_priority = {"BCC": 0, "FCC": 0, "SC": 1, "Unknown": 2}
+    for label, reference in reference_sequences.items():
+        reference_prefix = reference[:num_peaks]
 
-    candidates: List[Dict[str, Union[int, str, float, List[int]]]] = []
+        best_multiplier_for_structure = min_multiplier_to_try
+        best_error_for_structure = float("inf")
+        best_integers_for_structure: List[int] = []
 
-    for multiplier in range(min_multiplier_to_try, max_multiplier_to_try + 1):
-        # Scale the normalized ratios by this candidate multiplier.
-        scaled_ratios = [ratio * multiplier for ratio in sin2_ratios]
-        rounded_integers = [int(round(val)) for val in scaled_ratios]
+        for multiplier in range(min_multiplier_to_try, max_multiplier_to_try + 1):
+            # Scale the normalized ratios by this candidate multiplier.
+            scaled_ratios = [ratio * multiplier for ratio in sin2_ratios]
+            rounded_integers = [int(round(val)) for val in scaled_ratios]
 
-        # "Snap error": how far the scaled ratios are from ANY whole
-        # number in the first place (independent of which structure we
-        # compare against) -- a high snap error means this multiplier
-        # doesn't clear denominators well at all, regardless of lattice.
-        snap_error = sum(
-            abs(val - round(val)) for val in scaled_ratios
-        ) / num_peaks
+            # "Snap error": how far the scaled ratios are from ANY whole
+            # number in the first place, independent of which structure
+            # we compare against.
+            snap_error = sum(
+                abs(val - round(val)) for val in scaled_ratios
+            ) / num_peaks
 
-        for label, reference in reference_sequences.items():
-            # Compare rounded integers against this structure's
-            # reference sequence, truncated to however many peaks we
-            # actually have (can't match more reference entries than
-            # peaks detected).
-            reference_prefix = reference[:num_peaks]
-
-            # "Match error": how far the rounded integers are from this
-            # specific structure's expected sequence values.
+            # "Match error": how far the rounded integers are from THIS
+            # structure's expected reference values.
             match_error = sum(
                 abs(rounded_integers[i] - reference_prefix[i])
                 for i in range(len(reference_prefix))
             ) / num_peaks
 
-            # Combined confidence/error score: both the raw closeness-
-            # to-integer (snap_error) and the closeness-to-this-specific-
-            # lattice (match_error) matter. Equal weighting keeps the
-            # metric simple and interpretable.
             combined_error = snap_error + match_error
 
-            candidates.append({
+            all_candidates.append({
                 "error": combined_error,
                 "structure": label,
                 "multiplier": multiplier,
                 "final_integers": rounded_integers,
             })
 
-    # Find the single lowest error across the whole search grid.
-    best_error = min(c["error"] for c in candidates)
+            if combined_error < best_error_for_structure:
+                best_error_for_structure = combined_error
+                best_multiplier_for_structure = multiplier
+                best_integers_for_structure = rounded_integers
 
-    # Collect every candidate within `tie_epsilon` of that best error --
-    # on clean synthetic data, BCC (at its multiplier) and SC (at
-    # multiplier=1) will often BOTH appear here.
-    near_best = [c for c in candidates if c["error"] <= best_error + tie_epsilon]
+        # --- 6. Lattice parameter a, per peak, under this structure's ---
+        # --- hypothesis: a = wavelength * sqrt(h^2+k^2+l^2) / (2*sin(theta))
+        # We use the STRUCTURE'S REFERENCE integers (the theoretical
+        # h^2+k^2+l^2 values for this structure at this best multiplier),
+        # not the peak's own observed/rounded ratio -- this is what
+        # makes consistency-across-peaks a meaningful signal. If a peak
+        # doesn't actually correspond to a valid reflection for this
+        # structure, its reference value still exists (we always have
+        # `num_peaks` worth of reference entries available here since
+        # the sequences are pre-truncated to num_peaks), so a lattice
+        # parameter is ALWAYS computed for every peak under every
+        # structure, even when the fit is poor.
+        lattice_parameters: List[float] = []
+        for i in range(num_peaks):
+            hkl_sum = reference_prefix[i]
+            sin_theta = sin_thetas[i]
+            a_value = (wavelength * math.sqrt(hkl_sum)) / (2.0 * sin_theta)
+            lattice_parameters.append(a_value)
 
-    # Among the near-best candidates, prefer BCC/FCC over SC (see note
-    # above), then prefer the smallest multiplier as a final tiebreaker
-    # for full determinism.
+        avg_lattice_parameter = sum(lattice_parameters) / len(lattice_parameters)
+
+        hypotheses.append({
+            "structure": label,
+            "common_value": best_multiplier_for_structure,
+            "final_integers": best_integers_for_structure,
+            "error_score": best_error_for_structure,
+            "lattice_parameters": lattice_parameters,
+            "avg_lattice_parameter": avg_lattice_parameter,
+        })
+
+    # --- 7. Derive a single 'best_fit' convenience label for the DB ---
+    # Uses the same cross-structure tie-breaking as earlier versions:
+    # SC's reference sequence is a strict /2 subset of BCC's, so a true
+    # BCC pattern will ALSO score near-perfectly against SC at a smaller
+    # multiplier. We collect every candidate within `tie_epsilon` of the
+    # global best error and prefer BCC/FCC over SC among those ties.
+    #
+    # tie_epsilon is widened to 0.05 (from a much tighter 1e-6 in an
+    # earlier version) specifically to stay robust against the rounding
+    # noise introduced by manually-typed 2-Theta values (Verification
+    # Mode): a human typing "44.67" instead of the exact
+    # "44.67163127768449" introduces just enough numerical noise to
+    # push a true BCC fit's error slightly above a razor-thin tolerance,
+    # which previously caused it to lose the tie-break to SC by
+    # accident. 0.05 is generous enough to absorb that rounding noise
+    # while still being tight enough not to call two genuinely
+    # different-quality fits a "tie".
+    tie_epsilon = 0.05
+    structure_priority = {"BCC": 0, "FCC": 0, "SC": 1, "Unknown": 2}
+    acceptance_tolerance = 0.12
+
+    best_error = min(c["error"] for c in all_candidates)
+    near_best = [c for c in all_candidates if c["error"] <= best_error + tie_epsilon]
     near_best.sort(
         key=lambda c: (structure_priority.get(c["structure"], 2), c["multiplier"])
     )
     winner = near_best[0]
 
-    best_error = winner["error"]
-    best_structure = winner["structure"]
-    best_multiplier = winner["multiplier"]
-    best_final_integers = winner["final_integers"]
-
-    # --- 6. Reject low-confidence "best" matches rather than force one ---
-    if best_error > acceptance_tolerance:
-        best_structure = "Unknown"
+    best_fit = winner["structure"] if winner["error"] <= acceptance_tolerance else "Unknown"
 
     # --- Assemble and return the result dictionary ---
     return {
         "d_spacings": d_spacings,
         "sin2_ratios": sin2_ratios,
-        "common_value": best_multiplier,
-        "final_integers": best_final_integers,
-        "structure": best_structure,
+        "hypotheses": hypotheses,
+        "best_fit": best_fit,
     }
 
 
@@ -835,23 +868,44 @@ if __name__ == "__main__":
 
                 if peaks_2theta is not None:
                     try:
-                        # Step 2: run the physics directly on the
-                        # user-supplied peaks -- no image processing.
+                        # Step 2: run the physics -- evaluate all three
+                        # structure hypotheses (SC, BCC, FCC) directly
+                        # on the user-supplied peaks. No image processing.
                         analysis_result = calculate_crystal_structure(
                             peaks_2theta
                         )
 
-                        # Step 3: persist this run to SQLite, same as
-                        # the image-based flow.
+                        # Step 3: persist this run to SQLite. The DB
+                        # schema only has room for a single structure
+                        # label/common_value, so we log the 'best_fit'
+                        # hypothesis (and that hypothesis's own
+                        # multiplier) as a simple summary -- the full
+                        # multi-hypothesis comparison still lives in the
+                        # results table below, not in the DB.
+                        best_fit_label = analysis_result["best_fit"]
+                        best_fit_hypothesis = next(
+                            (
+                                h
+                                for h in analysis_result["hypotheses"]
+                                if h["structure"] == best_fit_label
+                            ),
+                            None,
+                        )
+                        best_fit_common_value = (
+                            best_fit_hypothesis["common_value"]
+                            if best_fit_hypothesis is not None
+                            else 0
+                        )
+
                         serialized_peaks = json.dumps(peaks_2theta)
                         serialized_ratios = json.dumps(
                             analysis_result["sin2_ratios"]
                         )
 
                         insert_calculation(
-                            common_value=analysis_result["common_value"],
+                            common_value=best_fit_common_value,
                             ratios=serialized_ratios,
-                            structure=analysis_result["structure"],
+                            structure=best_fit_label,
                             peaks=serialized_peaks,
                         )
 
@@ -918,20 +972,38 @@ if __name__ == "__main__":
                         st.session_state.image_bytes = None
                         st.stop()
 
-                    # Step 2: run the physics -- Bragg's Law d-spacings
-                    # and best-fit cubic structure classification.
+                    # Step 2: run the physics -- evaluate all three
+                    # structure hypotheses (SC, BCC, FCC).
                     analysis_result = calculate_crystal_structure(peaks_2theta)
 
-                    # Step 3: persist this run to SQLite. Lists are
-                    # JSON-serialized so they round-trip cleanly through
-                    # the TEXT columns.
+                    # Step 3: persist this run to SQLite. The DB schema
+                    # only has room for a single structure label/
+                    # common_value, so we log the 'best_fit' hypothesis
+                    # (and its own multiplier) as a simple summary -- the
+                    # full multi-hypothesis comparison lives in the
+                    # results table below, not in the DB.
+                    best_fit_label = analysis_result["best_fit"]
+                    best_fit_hypothesis = next(
+                        (
+                            h
+                            for h in analysis_result["hypotheses"]
+                            if h["structure"] == best_fit_label
+                        ),
+                        None,
+                    )
+                    best_fit_common_value = (
+                        best_fit_hypothesis["common_value"]
+                        if best_fit_hypothesis is not None
+                        else 0
+                    )
+
                     serialized_peaks = json.dumps(peaks_2theta)
                     serialized_ratios = json.dumps(analysis_result["sin2_ratios"])
 
                     insert_calculation(
-                        common_value=analysis_result["common_value"],
+                        common_value=best_fit_common_value,
                         ratios=serialized_ratios,
-                        structure=analysis_result["structure"],
+                        structure=best_fit_label,
                         peaks=serialized_peaks,
                     )
 
@@ -991,21 +1063,51 @@ if __name__ == "__main__":
         with col_metrics:
             st.subheader("Analysis Results")
 
-            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            metric_col1, metric_col2 = st.columns(2)
             with metric_col1:
-                st.metric("Crystal Structure", analysis_result["structure"])
+                st.metric("Best Fit (Logged)", analysis_result["best_fit"])
             with metric_col2:
-                st.metric("Common Value", analysis_result["common_value"])
-            with metric_col3:
                 st.metric("Peaks Found", len(peaks_2theta))
+
+            # --- Multi-Hypothesis Workbench: comparison table ---------
+            # Show every structure hypothesis side by side, rather than
+            # collapsing to a single winner. Even a poorly-fitting
+            # structure still shows its calculated lattice parameter, so
+            # the user can SEE why it's a bad fit (inconsistent `a`)
+            # rather than just being told it lost.
+            hypothesis_rows = [
+                {
+                    "Structure Type": h["structure"],
+                    "Calculated Lattice Parameter a (Å)": round(
+                        h["avg_lattice_parameter"], 4
+                    ),
+                    "Error Score": round(h["error_score"], 4),
+                }
+                for h in analysis_result["hypotheses"]
+            ]
+            hypothesis_df = pd.DataFrame(hypothesis_rows)
+            st.dataframe(hypothesis_df, use_container_width=True, hide_index=True)
+
+            st.caption(
+                "Note: A structure is valid if its lattice parameter "
+                "remains consistent across multiple peaks. Lower error "
+                "scores indicate a better fit."
+            )
 
             with st.expander("View detailed numeric results"):
                 st.write("**2-Theta peaks (degrees):**", peaks_2theta)
                 st.write("**d-spacings:**", analysis_result["d_spacings"])
                 st.write("**sin² ratios:**", analysis_result["sin2_ratios"])
-                st.write(
-                    "**Final integer sequence:**",
-                    analysis_result["final_integers"],
-                )
+                for h in analysis_result["hypotheses"]:
+                    st.write(
+                        f"**{h['structure']} final integers "
+                        f"(common_value={h['common_value']}):**",
+                        h["final_integers"],
+                    )
+                    st.write(
+                        f"**{h['structure']} per-peak lattice "
+                        f"parameters (Å):**",
+                        [round(a, 4) for a in h["lattice_parameters"]],
+                    )
     else:
         st.info("Upload a diffractogram image and click **Analyze** to begin.")
