@@ -1,15 +1,25 @@
-# Virtual Environments
-.venv/
-venv/
+# Environments
+.env
+.venv
 env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# Python Cache (keeps your repo clean)
-__pycache__/
-*.pyc
+# Streamlit
+.streamlit/
 
-# OS generated files (if you are on Mac)
-.DS_Store
-
-# Local Database (You don't want to push test data to the public internet)
+# Database files
 *.db
 *.sqlite3
+xrd_history.db
+
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS generated files
+.DS_Store
+Thumbs.db

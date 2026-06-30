@@ -554,11 +554,7 @@ def identify_material_api(
     "Cubic"` (restricting the returned `fields` to keep the request
     light) and performs the numeric `a_param +/- tolerance` filtering
     CLIENT-SIDE, in Python, against each result's
-    `structure.lattice.a`. This is slower than a hypothetical
-    server-side range filter would be, and -- because the Materials
-    Project database contains a very large number of cubic entries --
-    this call may be slow or, in a worst case, heavy on API quota; see
-    the Limitations section below.
+    `structure.lattice.a`.
 
     IMPORTANT NOTE on lazy import: `from mp_api.client import MPRester`
     happens INSIDE this function, not at module level. `mp-api` is a
@@ -584,16 +580,16 @@ def identify_material_api(
 
     Returns:
         list[dict]: A list of match dictionaries, sorted ascending by
-            how close each material's lattice parameter is to
-            `a_param` (best match first). Each dictionary contains:
-                - 'formula' (str): The material's pretty chemical
+            error (closeness to `a_param`; best match first). Each
+            dictionary contains:
+                - 'Formula' (str): The material's pretty chemical
                   formula (e.g. 'Fe', 'NaCl').
-                - 'material_id' (str): The Materials Project ID (e.g.
+                - 'Material ID' (str): The Materials Project ID (e.g.
                   'mp-13').
-                - 'lattice_parameter_a' (float): The material's exact
+                - 'Theoretical a' (float): The material's exact
                   theoretical lattice parameter `a`, in Angstroms, as
                   stored in the Materials Project database.
-                - 'delta' (float): The absolute difference between this
+                - 'Error' (float): The absolute difference between this
                   material's `a` and the user's `a_param`, in
                   Angstroms (smaller is a closer match).
 
@@ -601,7 +597,9 @@ def identify_material_api(
             `mp-api` package not being installed, or any other
             unexpected error), returns a list containing a SINGLE
             dictionary of the form {'error': '<human-readable message>'}
-            rather than raising -- callers should check for an 'error'
+            (lowercase 'error' key -- distinct from the 'Error' float
+            field used in successful match dictionaries above) rather
+            than raising. Callers should check for a lowercase 'error'
             key in the first element before treating the result as a
             list of material matches. If the query succeeds but no
             materials fall within tolerance, an empty list (`[]`) is
@@ -612,23 +610,16 @@ def identify_material_api(
         Nothing. This function is designed to be safe to call directly
         from Streamlit UI code without an enclosing try/except --
         all failure modes are caught internally and reported via the
-        return value, per the function's error-handling requirements.
+        return value.
 
     Limitations:
-        - Client-side filtering (see note above) means this function
-          may need to fetch and inspect a large number of cubic
-          materials before finding matches; on a slow connection or
-          for a very large result set this call can take a long time.
-          A production version would ideally page through results or
-          impose a server-side numeric filter if/when the Materials
-          Project API exposes one for lattice parameters directly.
-        - Only `crystal_system == "Cubic"` materials are considered, in
-          keeping with the rest of this app's cubic-only assumption
-          (SC/BCC/FCC). Non-cubic matches are never returned, even if
-          their `a`-axis length happens to be numerically close.
+        - Client-side filtering means this function may need to fetch
+          and inspect a large number of cubic materials before finding
+          matches; on a slow connection or for a very large result set
+          this call can take a long time.
+        - Only `crystal_system == "Cubic"` materials are considered.
         - Deprecated/superseded Materials Project entries are not
-          explicitly excluded; some results may correspond to legacy
-          or non-canonical calculations for a given composition.
+          explicitly excluded.
     """
     # --- Guard: a non-empty API key is required before attempting ---
     # --- any network call. ---
@@ -640,13 +631,7 @@ def identify_material_api(
     try:
         from mp_api.client import MPRester
     except ImportError:
-        return [{
-            "error": (
-                "The 'mp-api' package is not installed. Add 'mp-api' "
-                "to requirements.txt and install it to enable live "
-                "Materials Project search."
-            )
-        }]
+        return [{"error": "mp-api not installed"}]
 
     a_min = a_param - tolerance
     a_max = a_param + tolerance
@@ -667,11 +652,9 @@ def identify_material_api(
     except Exception as api_error:  # noqa: BLE001
         # Catches authentication failures (invalid API key), network
         # errors, timeouts, and any other failure from the MPRester
-        # client/HTTP layer. The Materials Project client does not
-        # document a single specific exception type for "bad API key"
-        # vs. "network down", so a broad catch here is intentional and
-        # is the safest way to guarantee this function never raises
-        # out to the caller, per the stated requirements.
+        # client/HTTP layer. A broad catch here is intentional and is
+        # the safest way to guarantee this function never raises out
+        # to the caller.
         return [{
             "error": (
                 "Materials Project search failed (check your API key "
@@ -698,16 +681,16 @@ def identify_material_api(
             continue
 
         if a_min <= doc_a <= a_max:
-            delta = abs(doc_a - a_param)
+            error = abs(doc_a - a_param)
             matches.append({
-                "formula": getattr(doc, "formula_pretty", "Unknown"),
-                "material_id": str(getattr(doc, "material_id", "Unknown")),
-                "lattice_parameter_a": doc_a,
-                "delta": delta,
+                "Formula": getattr(doc, "formula_pretty", "Unknown"),
+                "Material ID": str(getattr(doc, "material_id", "Unknown")),
+                "Theoretical a": doc_a,
+                "Error": error,
             })
 
-    # --- Sort by closeness to the user's calculated a_param ---
-    matches.sort(key=lambda m: m["delta"])
+    # --- Sort by lowest error (closeness to the user's calculated a_param)
+    matches.sort(key=lambda m: m["Error"])
 
     return matches
 
@@ -909,22 +892,40 @@ if __name__ == "__main__":
         st.session_state.image_bytes = None
 
     # --- 4. Sidebar ---------------------------------------------------
-    # Sidebar now holds two things: the Materials Project API key input
-    # (Step 5) and Calculation History. No uploader, no axis inputs, no
-    # title here -- everything else actionable lives on the main page.
+    # Sidebar now holds three things: secure Materials Project API key
+    # handling (Step 5), the API key fallback input, and Calculation
+    # History. No uploader, no axis inputs, no title here -- everything
+    # else actionable lives on the main page.
     with st.sidebar:
         st.subheader("Materials Project Search")
-        mp_api_key = st.text_input(
-            "Materials Project API Key",
-            type="password",
-            help=(
-                "Get a free API key by registering at "
-                "materialsproject.org, then find it on your account "
-                "dashboard. Used to search the live Materials Project "
-                "database for materials matching your calculated "
-                "lattice parameter."
-            ),
-        )
+
+        # Prefer a key configured via Streamlit secrets (st.secrets),
+        # e.g. set in .streamlit/secrets.toml as MP_API_KEY = "...".
+        # This lets an app deployer pre-configure a shared key so
+        # individual users don't have to enter their own. .get(...) is
+        # used (rather than st.secrets["MP_API_KEY"]) so this does not
+        # raise when no secrets file/key is configured at all.
+        global_api_key = st.secrets.get("MP_API_KEY", "")
+
+        if global_api_key:
+            # A global key is already configured -- no need to prompt
+            # the user for their own.
+            active_api_key = global_api_key
+            st.caption("Using a pre-configured Materials Project API key.")
+        else:
+            # No global key available: fall back to letting the user
+            # enter their own, same as before.
+            active_api_key = st.text_input(
+                "Materials Project API Key",
+                type="password",
+                help=(
+                    "Get a free API key by registering at "
+                    "materialsproject.org, then find it on your account "
+                    "dashboard. Used to search the live Materials "
+                    "Project database for materials matching your "
+                    "calculated lattice parameter."
+                ),
+            )
 
         st.divider()
 
@@ -1322,7 +1323,7 @@ if __name__ == "__main__":
 
             best_fit_label = analysis_result["best_fit"]
 
-            if not mp_api_key or not mp_api_key.strip():
+            if not active_api_key or not active_api_key.strip():
                 # No key entered: explain what's needed, exactly as
                 # specified, rather than silently showing nothing.
                 st.info(
@@ -1363,9 +1364,9 @@ if __name__ == "__main__":
                 else:
                     target_a = winning_hypothesis["avg_lattice_parameter"]
 
-                    with st.spinner("Searching database..."):
+                    with st.spinner("Searching live database..."):
                         material_matches = identify_material_api(
-                            api_key=mp_api_key,
+                            api_key=active_api_key,
                             a_param=target_a,
                         )
 
@@ -1374,7 +1375,9 @@ if __name__ == "__main__":
                         and "error" in material_matches[0]
                     ):
                         # identify_material_api's documented failure
-                        # signal: a single dict with an 'error' key.
+                        # signal: a single dict with a lowercase
+                        # 'error' key (distinct from the 'Error' float
+                        # field used in successful match dicts below).
                         st.error(material_matches[0]["error"])
                     elif not material_matches:
                         st.info(
@@ -1387,14 +1390,12 @@ if __name__ == "__main__":
                         matches_df = pd.DataFrame(
                             [
                                 {
-                                    "Formula": m["formula"],
-                                    "Material ID": m["material_id"],
-                                    "Lattice Parameter a (Å)": round(
-                                        m["lattice_parameter_a"], 4
+                                    "Formula": m["Formula"],
+                                    "Material ID": m["Material ID"],
+                                    "Theoretical a (Å)": round(
+                                        m["Theoretical a"], 4
                                     ),
-                                    "Δ from Calculated a (Å)": round(
-                                        m["delta"], 4
-                                    ),
+                                    "Error (Å)": round(m["Error"], 4),
                                 }
                                 for m in material_matches
                             ]
